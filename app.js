@@ -24,6 +24,8 @@ const SCAN_LIMIT = 220;
 const RELAYER_FEE_LAMPORTS = '0';
 const REQUEST_RETRY_ATTEMPTS = 8;
 const REQUEST_RETRY_WAIT_MS = 4000;
+const MIN_SOL_DEPOSIT_LAMPORTS = 50_000_000n;
+const MIN_SOL_DEPOSIT_TEXT = '0.05';
 
 const TOKEN_PROGRAM_ID = new PublicKey(
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
@@ -60,6 +62,7 @@ const els = {
 let provider = null;
 let poseidonPromise = null;
 let latestNote = null;
+let busy = false;
 
 boot();
 
@@ -68,6 +71,7 @@ function boot() {
 
   els.connectBtn.addEventListener('click', onConnectWallet);
   els.sendBtn.addEventListener('click', onSend);
+  els.amountSol.addEventListener('input', syncSendButtonState);
   els.copyNoteBtn.addEventListener('click', onCopyNote);
   els.downloadNoteBtn.addEventListener('click', onDownloadNote);
 
@@ -76,6 +80,7 @@ function boot() {
   }
 
   resetProgress();
+  syncSendButtonState();
   log('准备就绪。');
 }
 
@@ -104,11 +109,12 @@ function log(message, level = 'info') {
   els.logBox.textContent = `${prefix} ${ts} ${message}\n${els.logBox.textContent}`;
 }
 
-function setBusy(isBusy) {
-  els.connectBtn.disabled = isBusy;
-  els.sendBtn.disabled = isBusy;
-  els.copyNoteBtn.disabled = isBusy;
-  els.downloadNoteBtn.disabled = isBusy;
+function setBusy(nextBusy) {
+  busy = Boolean(nextBusy);
+  els.connectBtn.disabled = busy;
+  els.copyNoteBtn.disabled = busy;
+  els.downloadNoteBtn.disabled = busy;
+  syncSendButtonState();
 }
 
 function resetProgress() {
@@ -147,16 +153,34 @@ async function onConnectWallet() {
 function parseSolToLamports(raw) {
   const value = raw.trim();
   if (!/^\d+(\.\d+)?$/.test(value)) {
-    throw new Error('金额格式错误');
+    throw new Error("金额格式错误");
   }
 
-  const [whole, fracRaw = ''] = value.split('.');
-  const frac = (fracRaw + '000000000').slice(0, 9);
+  const [whole, fracRaw = ""] = value.split(".");
+  const frac = (fracRaw + "000000000").slice(0, 9);
   const lamports = BigInt(whole) * 1_000_000_000n + BigInt(frac);
   if (lamports <= 0n) {
-    throw new Error('金额必须大于 0');
+    throw new Error("金额必须大于 0");
   }
   return lamports;
+}
+
+function isAmountSendable(raw) {
+  const value = raw.trim();
+  if (!/^\d+(\.\d+)?$/.test(value)) {
+    return false;
+  }
+
+  const [whole, fracRaw = ""] = value.split(".");
+  const frac = (fracRaw + "000000000").slice(0, 9);
+  const lamports = BigInt(whole) * 1_000_000_000n + BigInt(frac);
+  return lamports >= MIN_SOL_DEPOSIT_LAMPORTS;
+}
+
+function syncSendButtonState() {
+  const amountOk = isAmountSendable(els.amountSol.value);
+  els.sendBtn.disabled = busy || !amountOk;
+  els.sendBtn.title = amountOk ? "" : "最低发送金额 " + MIN_SOL_DEPOSIT_TEXT + " SOL";
 }
 
 function bytesToHex(bytes) {
@@ -448,20 +472,38 @@ async function onSend() {
     return;
   }
 
+  const recipient = els.recipient.value.trim();
+  if (!recipient) {
+    log('请填写收币地址。', 'warn');
+    return;
+  }
+
+  try {
+    new PublicKey(recipient);
+  } catch {
+    log('收币地址格式错误。', 'warn');
+    return;
+  }
+
+  let amountLamports;
+  try {
+    amountLamports = parseSolToLamports(els.amountSol.value);
+  } catch (error) {
+    log(error instanceof Error ? error.message : String(error), 'warn');
+    return;
+  }
+
+  if (amountLamports < MIN_SOL_DEPOSIT_LAMPORTS) {
+    log('最低发送金额为 ' + MIN_SOL_DEPOSIT_TEXT + ' SOL。', 'warn');
+    return;
+  }
+
   try {
     setBusy(true);
     resetProgress();
     els.requestId.textContent = '-';
     els.txLink.href = '#';
     els.txLink.textContent = '等待交易';
-
-    const recipient = els.recipient.value.trim();
-    if (!recipient) {
-      throw new Error('请填写收币地址');
-    }
-    new PublicKey(recipient);
-
-    const amountLamports = parseSolToLamports(els.amountSol.value);
 
     const connection = getConnection();
     const programId = getProgramId();
