@@ -15,6 +15,12 @@ const DEFAULT_PROGRAM_ID = 'XmixQ4DB8MtKcEFhyjWs1gZtdaF3YDuF4ieGLJ3xotv';
 const DEFAULT_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_RELAYER_API = 'https://api.xmix.dev';
 
+const ASSET_TYPE_SOL = 0;
+const SCAN_LIMIT = 220;
+const RELAYER_FEE_LAMPORTS = '0';
+const REQUEST_RETRY_ATTEMPTS = 8;
+const REQUEST_RETRY_WAIT_MS = 4000;
+
 const TOKEN_PROGRAM_ID = new PublicKey(
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 );
@@ -31,33 +37,20 @@ const SNARK_FIELD_SIZE = BigInt(
 const TREE_LEVELS = 20;
 
 const els = {
-  rpcUrl: document.getElementById('rpcUrl'),
-  programId: document.getElementById('programId'),
-  mint: document.getElementById('mint'),
-  assetType: document.getElementById('assetType'),
-  pool: document.getElementById('pool'),
-  vault: document.getElementById('vault'),
-  amountSol: document.getElementById('amountSol'),
-  scanLimit: document.getElementById('scanLimit'),
-  autoRoot: document.getElementById('autoRoot'),
   walletStatus: document.getElementById('walletStatus'),
   connectBtn: document.getElementById('connectBtn'),
-  deriveBtn: document.getElementById('deriveBtn'),
-  depositBtn: document.getElementById('depositBtn'),
-  relayerApiUrl: document.getElementById('relayerApiUrl'),
-  withdrawRecipient: document.getElementById('withdrawRecipient'),
-  relayerFeeLamports: document.getElementById('relayerFeeLamports'),
-  recipientAmountLamports: document.getElementById('recipientAmountLamports'),
-  fillRecipientBtn: document.getElementById('fillRecipientBtn'),
-  buildWithdrawRequestBtn: document.getElementById('buildWithdrawRequestBtn'),
-  requestIdResult: document.getElementById('requestIdResult'),
-  requestFileResult: document.getElementById('requestFileResult'),
-  signature: document.getElementById('signature'),
-  solscanLink: document.getElementById('solscanLink'),
+  recipient: document.getElementById('recipient'),
+  amountSol: document.getElementById('amountSol'),
+  sendBtn: document.getElementById('sendBtn'),
+  txLink: document.getElementById('txLink'),
+  requestId: document.getElementById('requestId'),
   note: document.getElementById('note'),
   copyNoteBtn: document.getElementById('copyNoteBtn'),
   downloadNoteBtn: document.getElementById('downloadNoteBtn'),
   logBox: document.getElementById('logBox'),
+  stepDeposit: document.getElementById('stepDeposit'),
+  stepRequest: document.getElementById('stepRequest'),
+  stepDone: document.getElementById('stepDone'),
 };
 
 let provider = null;
@@ -67,29 +60,33 @@ let latestNote = null;
 boot();
 
 function boot() {
-  els.rpcUrl.value = DEFAULT_RPC;
-  els.programId.value = DEFAULT_PROGRAM_ID;
-  els.mint.value = DEFAULT_MINT;
-  els.relayerApiUrl.value = DEFAULT_RELAYER_API;
+  provider = getWalletProvider();
 
   els.connectBtn.addEventListener('click', onConnectWallet);
-  els.deriveBtn.addEventListener('click', onDerivePdas);
-  els.depositBtn.addEventListener('click', onDeposit);
-  els.fillRecipientBtn.addEventListener('click', onFillRecipient);
-  els.buildWithdrawRequestBtn.addEventListener('click', onBuildWithdrawRequest);
+  els.sendBtn.addEventListener('click', onSend);
   els.copyNoteBtn.addEventListener('click', onCopyNote);
   els.downloadNoteBtn.addEventListener('click', onDownloadNote);
 
-  provider = getWalletProvider();
   if (!provider) {
-    log('未检测到 Solana 钱包扩展，请安装 Phantom。', 'warn');
+    log('未检测到 Phantom 钱包扩展。', 'warn');
   }
+
+  resetProgress();
+  log('准备就绪。');
 }
 
 function getWalletProvider() {
   if (window?.phantom?.solana?.isPhantom) return window.phantom.solana;
   if (window?.solana?.isPhantom) return window.solana;
   return null;
+}
+
+function getConnection() {
+  return new Connection(DEFAULT_RPC, 'confirmed');
+}
+
+function getProgramId() {
+  return new PublicKey(DEFAULT_PROGRAM_ID);
 }
 
 function log(message, level = 'info') {
@@ -99,18 +96,28 @@ function log(message, level = 'info') {
 }
 
 function setBusy(isBusy) {
-  els.depositBtn.disabled = isBusy;
-  els.deriveBtn.disabled = isBusy;
   els.connectBtn.disabled = isBusy;
-  els.fillRecipientBtn.disabled = isBusy;
-  els.buildWithdrawRequestBtn.disabled = isBusy;
+  els.sendBtn.disabled = isBusy;
+  els.copyNoteBtn.disabled = isBusy;
+  els.downloadNoteBtn.disabled = isBusy;
+}
+
+function resetProgress() {
+  for (const item of [els.stepDeposit, els.stepRequest, els.stepDone]) {
+    item.classList.remove('running', 'done', 'error');
+  }
+}
+
+function setProgress(stepEl, state) {
+  stepEl.classList.remove('running', 'done', 'error');
+  if (state) {
+    stepEl.classList.add(state);
+  }
 }
 
 async function onConnectWallet() {
   try {
-    if (!provider) {
-      throw new Error('未检测到 Phantom');
-    }
+    if (!provider) throw new Error('未检测到 Phantom');
 
     await provider.connect();
 
@@ -120,25 +127,29 @@ async function onConnectWallet() {
     const sol = Number(bal) / LAMPORTS_PER_SOL;
 
     els.walletStatus.textContent = `${address} | ${sol.toFixed(4)} SOL`;
-    if (!els.withdrawRecipient.value.trim()) {
-      els.withdrawRecipient.value = address;
+    if (!els.recipient.value.trim()) {
+      els.recipient.value = address;
     }
+
     log(`钱包已连接: ${address}`);
   } catch (error) {
     log(error.message ?? String(error), 'error');
   }
 }
 
-function getConnection() {
-  return new Connection(els.rpcUrl.value.trim(), 'confirmed');
-}
+function parseSolToLamports(raw) {
+  const value = raw.trim();
+  if (!/^\d+(\.\d+)?$/.test(value)) {
+    throw new Error('金额格式错误');
+  }
 
-function getProgramId() {
-  return new PublicKey(els.programId.value.trim());
-}
-
-function getAssetTypeByte() {
-  return Number(els.assetType.value);
+  const [whole, fracRaw = ''] = value.split('.');
+  const frac = (fracRaw + '000000000').slice(0, 9);
+  const lamports = BigInt(whole) * 1_000_000_000n + BigInt(frac);
+  if (lamports <= 0n) {
+    throw new Error('金额必须大于 0');
+  }
+  return lamports;
 }
 
 function bytesToHex(bytes) {
@@ -225,32 +236,6 @@ async function computeMerkleRoot(commitments) {
   return level[0];
 }
 
-function parseSolToLamports(raw) {
-  const value = raw.trim();
-  if (!/^\d+(\.\d+)?$/.test(value)) {
-    throw new Error('存款金额格式错误');
-  }
-
-  const [whole, fracRaw = ''] = value.split('.');
-  const frac = (fracRaw + '000000000').slice(0, 9);
-  return BigInt(whole) * 1_000_000_000n + BigInt(frac);
-}
-
-function encodeDepositData(amountLamports, commitment, newRoot) {
-  const data = new Uint8Array(80);
-  data.set(DEPOSIT_DISCRIMINATOR, 0);
-
-  let temp = amountLamports;
-  for (let i = 0; i < 8; i += 1) {
-    data[8 + i] = Number(temp & 0xffn);
-    temp >>= 8n;
-  }
-
-  data.set(commitment, 16);
-  data.set(newRoot, 48);
-  return data;
-}
-
 function parseDepositCommitment(ix) {
   if (!('data' in ix)) return null;
 
@@ -329,23 +314,128 @@ function derivePoolAndVault(programId, mintPk, assetTypeByte) {
   return { pool, vault };
 }
 
-async function onDerivePdas() {
-  try {
-    const programId = getProgramId();
-    const mintPk = new PublicKey(els.mint.value.trim());
-    const { pool, vault } = derivePoolAndVault(programId, mintPk, getAssetTypeByte());
+function encodeDepositData(amountLamports, commitment, newRoot) {
+  const data = new Uint8Array(80);
+  data.set(DEPOSIT_DISCRIMINATOR, 0);
 
-    els.pool.value = pool.toBase58();
-    els.vault.value = vault.toBase58();
-
-    log(`已推导 Pool: ${pool.toBase58()}`);
-    log(`已推导 Vault: ${vault.toBase58()}`);
-  } catch (error) {
-    log(error.message ?? String(error), 'error');
+  let temp = amountLamports;
+  for (let i = 0; i < 8; i += 1) {
+    data[8 + i] = Number(temp & 0xffn);
+    temp >>= 8n;
   }
+
+  data.set(commitment, 16);
+  data.set(newRoot, 48);
+  return data;
 }
 
-async function onDeposit() {
+async function sendDepositTx({ connection, walletPubkey, amountLamports, commitment, newRoot, poolPk, vaultPk }) {
+  const programId = getProgramId();
+  const mintPk = new PublicKey(DEFAULT_MINT);
+
+  const ixData = encodeDepositData(amountLamports, commitment, newRoot);
+
+  const placeholder = programId;
+  const keys = [
+    { pubkey: walletPubkey, isSigner: true, isWritable: true },
+    { pubkey: poolPk, isSigner: false, isWritable: true },
+    { pubkey: mintPk, isSigner: false, isWritable: true },
+    { pubkey: vaultPk, isSigner: false, isWritable: true },
+    { pubkey: placeholder, isSigner: false, isWritable: true },
+    { pubkey: placeholder, isSigner: false, isWritable: true },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+  ];
+
+  const ix = new TransactionInstruction({
+    programId,
+    keys,
+    data: ixData,
+  });
+
+  const tx = new Transaction().add(ix);
+  tx.feePayer = walletPubkey;
+
+  const latest = await connection.getLatestBlockhash('confirmed');
+  tx.recentBlockhash = latest.blockhash;
+
+  let signature;
+  if (typeof provider.signAndSendTransaction === 'function') {
+    const res = await provider.signAndSendTransaction(tx);
+    signature = typeof res === 'string' ? res : res.signature;
+  } else if (typeof provider.signTransaction === 'function') {
+    const signed = await provider.signTransaction(tx);
+    signature = await connection.sendRawTransaction(signed.serialize());
+  } else {
+    throw new Error('钱包不支持 signAndSendTransaction/signTransaction');
+  }
+
+  if (!signature) {
+    throw new Error('未获取到交易签名');
+  }
+
+  await connection.confirmTransaction(
+    {
+      signature,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight,
+    },
+    'confirmed'
+  );
+
+  return signature;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function buildWithdrawRequest(note, recipient) {
+  let lastError = 'unknown error';
+
+  for (let attempt = 1; attempt <= REQUEST_RETRY_ATTEMPTS; attempt += 1) {
+    const res = await fetch(`${DEFAULT_RELAYER_API}/api/relay-request/build`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        note,
+        recipient,
+        relayerFeeLamports: RELAYER_FEE_LAMPORTS,
+      }),
+    });
+
+    let payload = null;
+    try {
+      payload = await res.json();
+    } catch {
+      // ignore
+    }
+
+    if (res.ok && payload?.ok) {
+      return payload.result;
+    }
+
+    lastError = payload?.error || `HTTP ${res.status}`;
+    const retryable =
+      lastError.includes('Deposit not found in relayer state') ||
+      lastError.includes('missing decoded deposit payload');
+
+    if (!retryable || attempt >= REQUEST_RETRY_ATTEMPTS) {
+      throw new Error(lastError);
+    }
+
+    log(`Relayer 尚未索引到该 Deposit，${REQUEST_RETRY_WAIT_MS / 1000}s 后重试 (${attempt}/${REQUEST_RETRY_ATTEMPTS})...`, 'warn');
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(REQUEST_RETRY_WAIT_MS);
+  }
+
+  throw new Error(lastError);
+}
+
+async function onSend() {
   if (!provider?.publicKey) {
     log('请先连接钱包。', 'warn');
     return;
@@ -353,123 +443,58 @@ async function onDeposit() {
 
   try {
     setBusy(true);
+    resetProgress();
+    els.requestId.textContent = '-';
+    els.txLink.href = '#';
+    els.txLink.textContent = '等待交易';
+
+    const recipient = els.recipient.value.trim();
+    if (!recipient) {
+      throw new Error('请填写收币地址');
+    }
+    new PublicKey(recipient);
+
+    const amountLamports = parseSolToLamports(els.amountSol.value);
 
     const connection = getConnection();
     const programId = getProgramId();
-    const mintPk = new PublicKey(els.mint.value.trim());
-    const assetTypeByte = getAssetTypeByte();
+    const mintPk = new PublicKey(DEFAULT_MINT);
+    const { pool, vault } = derivePoolAndVault(programId, mintPk, ASSET_TYPE_SOL);
 
-    if (assetTypeByte !== 0) {
-      throw new Error('当前页面仅支持 SOL 池');
-    }
+    setProgress(els.stepDeposit, 'running');
+    log('开始构建 Deposit...');
 
-    let poolPk;
-    let vaultPk;
-
-    if (els.pool.value.trim() && els.vault.value.trim()) {
-      poolPk = new PublicKey(els.pool.value.trim());
-      vaultPk = new PublicKey(els.vault.value.trim());
-    } else {
-      const derived = derivePoolAndVault(programId, mintPk, assetTypeByte);
-      poolPk = derived.pool;
-      vaultPk = derived.vault;
-      els.pool.value = poolPk.toBase58();
-      els.vault.value = vaultPk.toBase58();
-    }
-
-    const amountLamports = parseSolToLamports(els.amountSol.value);
-    if (amountLamports <= 0n) {
-      throw new Error('存款金额必须大于 0');
-    }
-
-    log('生成 note 秘密参数...');
     const secret = random32Bytes();
     const nullifier = random32Bytes();
-    const commitment = await generateCommitment(secret, nullifier, amountLamports, poolPk);
+    const commitment = await generateCommitment(secret, nullifier, amountLamports, pool);
 
-    let newRoot;
-    const scanLimit = Number(els.scanLimit.value || '120');
+    log('扫描历史 Deposit，重建最新 Merkle Root...');
+    const oldCommitments = await fetchPoolCommitments(connection, programId, pool, SCAN_LIMIT);
+    const newRoot = await computeMerkleRoot([...oldCommitments, commitment]);
 
-    if (els.autoRoot.checked) {
-      log(`扫描链上历史 Deposit（limit=${scanLimit}）...`);
-      const oldCommitments = await fetchPoolCommitments(
-        connection,
-        programId,
-        poolPk,
-        Number.isFinite(scanLimit) ? scanLimit : 120
-      );
-
-      log(`已抓取 ${oldCommitments.length} 条历史 commitment`);
-      newRoot = await computeMerkleRoot([...oldCommitments, commitment]);
-    } else {
-      newRoot = commitment;
-      log('未启用自动 root，new_root 已临时设置为 commitment', 'warn');
-    }
-
-    const ixData = encodeDepositData(amountLamports, commitment, newRoot);
-
-    const placeholder = programId;
-    const keys = [
-      { pubkey: provider.publicKey, isSigner: true, isWritable: true },
-      { pubkey: poolPk, isSigner: false, isWritable: true },
-      { pubkey: mintPk, isSigner: false, isWritable: true },
-      { pubkey: vaultPk, isSigner: false, isWritable: true },
-      { pubkey: placeholder, isSigner: false, isWritable: true },
-      { pubkey: placeholder, isSigner: false, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-    ];
-
-    const ix = new TransactionInstruction({
-      programId,
-      keys,
-      data: ixData,
+    log('发送链上 Deposit 交易...');
+    const signature = await sendDepositTx({
+      connection,
+      walletPubkey: provider.publicKey,
+      amountLamports,
+      commitment,
+      newRoot,
+      poolPk: pool,
+      vaultPk: vault,
     });
 
-    const tx = new Transaction().add(ix);
-    tx.feePayer = provider.publicKey;
-
-    const latest = await connection.getLatestBlockhash('confirmed');
-    tx.recentBlockhash = latest.blockhash;
-
-    log('发送交易...');
-
-    let signature;
-    if (typeof provider.signAndSendTransaction === 'function') {
-      const res = await provider.signAndSendTransaction(tx);
-      signature = typeof res === 'string' ? res : res.signature;
-    } else if (typeof provider.signTransaction === 'function') {
-      const signed = await provider.signTransaction(tx);
-      signature = await connection.sendRawTransaction(signed.serialize());
-    } else {
-      throw new Error('钱包不支持 signAndSendTransaction/signTransaction');
-    }
-
-    if (!signature) {
-      throw new Error('未获取到交易签名');
-    }
-
-    log(`交易已提交: ${signature}`);
-
-    await connection.confirmTransaction(
-      {
-        signature,
-        blockhash: latest.blockhash,
-        lastValidBlockHeight: latest.lastValidBlockHeight,
-      },
-      'confirmed'
-    );
-
-    log('交易确认成功。');
+    setProgress(els.stepDeposit, 'done');
+    els.txLink.href = `https://solscan.io/tx/${signature}`;
+    els.txLink.textContent = signature;
+    log(`Deposit 成功: ${signature}`);
 
     const note = {
       version: 1,
       createdAt: new Date().toISOString(),
-      rpcUrl: els.rpcUrl.value.trim(),
+      rpcUrl: DEFAULT_RPC,
       programId: programId.toBase58(),
-      pool: poolPk.toBase58(),
-      vault: vaultPk.toBase58(),
+      pool: pool.toBase58(),
+      vault: vault.toBase58(),
       mint: mintPk.toBase58(),
       assetType: 'sol',
       amountLamports: amountLamports.toString(),
@@ -482,126 +507,27 @@ async function onDeposit() {
     };
 
     latestNote = note;
-
-    els.signature.value = signature;
-    els.solscanLink.href = `https://solscan.io/tx/${signature}`;
-    els.solscanLink.textContent = `https://solscan.io/tx/${signature}`;
     els.note.value = JSON.stringify(note, null, 2);
 
-    log('Note 已生成，可复制或下载。');
+    setProgress(els.stepRequest, 'running');
+    log('提交 Withdraw 请求到 relayer...');
+    const req = await buildWithdrawRequest(note, recipient);
+
+    setProgress(els.stepRequest, 'done');
+    setProgress(els.stepDone, 'done');
+    els.requestId.textContent = req.requestId ?? '-';
+
+    log(`请求已入队: ${req.requestId}`);
+    log('流程完成。请等待 relayer 执行 transfer。');
   } catch (error) {
-    log(error.message ?? String(error), 'error');
-  } finally {
-    setBusy(false);
-  }
-}
-
-function onFillRecipient() {
-  try {
-    if (!provider?.publicKey) {
-      throw new Error('请先连接钱包');
+    const message = error instanceof Error ? error.message : String(error);
+    if (!els.stepDeposit.classList.contains('done')) {
+      setProgress(els.stepDeposit, 'error');
+    } else {
+      setProgress(els.stepRequest, 'error');
+      setProgress(els.stepDone, 'error');
     }
-    els.withdrawRecipient.value = provider.publicKey.toBase58();
-    log('已填入当前钱包地址为 recipient');
-  } catch (error) {
-    log(error.message ?? String(error), 'error');
-  }
-}
-
-function normalizeApiBase(raw) {
-  const value = raw.trim();
-  if (!value) {
-    throw new Error('Relayer API URL 不能为空');
-  }
-  return value.endsWith('/') ? value.slice(0, -1) : value;
-}
-
-function parseNoteJson(raw) {
-  const note = JSON.parse(raw);
-
-  if (!note || typeof note !== 'object') {
-    throw new Error('note JSON 格式错误');
-  }
-
-  const required = ['depositSignature', 'secretHex', 'nullifierHex'];
-  for (const key of required) {
-    if (!note[key] || typeof note[key] !== 'string') {
-      throw new Error(`note 缺少字段: ${key}`);
-    }
-  }
-
-  return {
-    depositSignature: note.depositSignature,
-    secretHex: note.secretHex,
-    nullifierHex: note.nullifierHex,
-  };
-}
-
-async function onBuildWithdrawRequest() {
-  try {
-    setBusy(true);
-
-    const apiBase = normalizeApiBase(els.relayerApiUrl.value);
-    const recipient = els.withdrawRecipient.value.trim();
-    if (!recipient) {
-      throw new Error('Recipient 不能为空');
-    }
-
-    // Validate pubkey format early.
-    new PublicKey(recipient);
-
-    const noteRaw = els.note.value.trim();
-    if (!noteRaw) {
-      throw new Error('请先生成 note 或粘贴 note JSON');
-    }
-
-    const note = parseNoteJson(noteRaw);
-
-    const relayerFeeLamports = els.relayerFeeLamports.value.trim();
-    if (relayerFeeLamports && !/^\d+$/.test(relayerFeeLamports)) {
-      throw new Error('Relayer Fee 必须是整数 lamports');
-    }
-
-    const recipientAmountLamports = els.recipientAmountLamports.value.trim();
-    if (recipientAmountLamports && !/^\d+$/.test(recipientAmountLamports)) {
-      throw new Error('Recipient Amount 必须是整数 lamports');
-    }
-
-    log('向 relayer API 提交提现请求...');
-
-    const res = await fetch(`${apiBase}/api/relay-request/build`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        note,
-        recipient,
-        relayerFeeLamports: relayerFeeLamports || '0',
-        recipientAmountLamports: recipientAmountLamports || undefined,
-      }),
-    });
-
-    let payload = null;
-    try {
-      payload = await res.json();
-    } catch {
-      // keep null
-    }
-
-    if (!res.ok || !payload?.ok) {
-      const errMsg = payload?.error || `HTTP ${res.status}`;
-      throw new Error(`提交失败: ${errMsg}`);
-    }
-
-    els.requestIdResult.value = payload.result.requestId ?? '';
-    els.requestFileResult.value = payload.result.filePath ?? '';
-
-    log(
-      `提现请求已入队: requestId=${payload.result.requestId}, deposit=${payload.result.depositSignature}`
-    );
-  } catch (error) {
-    log(error.message ?? String(error), 'error');
+    log(message, 'error');
   } finally {
     setBusy(false);
   }
@@ -610,7 +536,7 @@ async function onBuildWithdrawRequest() {
 async function onCopyNote() {
   try {
     if (!els.note.value.trim()) {
-      throw new Error('当前没有可复制的 note');
+      throw new Error('当前没有可复制的 Note');
     }
     await navigator.clipboard.writeText(els.note.value);
     log('Note 已复制到剪贴板。');
@@ -622,7 +548,7 @@ async function onCopyNote() {
 function onDownloadNote() {
   try {
     if (!latestNote) {
-      throw new Error('当前没有可下载的 note');
+      throw new Error('当前没有可下载的 Note');
     }
 
     const file = new Blob([JSON.stringify(latestNote, null, 2)], {
@@ -651,8 +577,8 @@ window.addEventListener('load', async () => {
       const bal = await connection.getBalance(provider.publicKey, 'confirmed');
       const sol = Number(bal) / LAMPORTS_PER_SOL;
       els.walletStatus.textContent = `${provider.publicKey.toBase58()} | ${sol.toFixed(4)} SOL`;
-      if (!els.withdrawRecipient.value.trim()) {
-        els.withdrawRecipient.value = provider.publicKey.toBase58();
+      if (!els.recipient.value.trim()) {
+        els.recipient.value = provider.publicKey.toBase58();
       }
     }
   } catch {

@@ -2,11 +2,21 @@
 
 Standalone frontend for x-mix.
 
-## Features
-- Connect Phantom wallet
-- Build and send SOL `deposit`
-- Generate/download note (`secretHex` + `nullifierHex`)
-- Submit withdraw request directly to relayer API
+## UX
+- Connect wallet
+- Fill recipient address
+- Input amount
+- Click `确认发送`
+
+The page will automatically:
+- send on-chain `deposit`
+- generate and show backup note
+- call relayer API `POST /api/relay-request/build`
+
+## Defaults
+- RPC: Chainstack mainnet endpoint
+- Program ID: `XmixQ4DB8MtKcEFhyjWs1gZtdaF3YDuF4ieGLJ3xotv`
+- Relayer API: `https://api.xmix.dev`
 
 ## Local run
 
@@ -24,18 +34,3 @@ Open: `http://127.0.0.1:4173`
 3. Build command: leave empty.
 4. Output directory: leave empty.
 5. Deploy.
-
-## Relayer API
-
-Default in page: `http://127.0.0.1:8787`.
-
-After deploying, set the page field to your public relayer API URL, for example:
-- `https://relayer.yourdomain.com`
-
-On relayer side, allow your Vercel domain in CORS:
-
-```env
-RELAYER_API_CORS_ORIGIN=https://your-vercel-domain.vercel.app
-```
-
-(or `*` during testing)
