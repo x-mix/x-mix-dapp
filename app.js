@@ -127,9 +127,6 @@ async function onConnectWallet() {
     const sol = Number(bal) / LAMPORTS_PER_SOL;
 
     els.walletStatus.textContent = `${address} | ${sol.toFixed(4)} SOL`;
-    if (!els.recipient.value.trim()) {
-      els.recipient.value = address;
-    }
 
     log(`钱包已连接: ${address}`);
   } catch (error) {
@@ -577,9 +574,6 @@ window.addEventListener('load', async () => {
       const bal = await connection.getBalance(provider.publicKey, 'confirmed');
       const sol = Number(bal) / LAMPORTS_PER_SOL;
       els.walletStatus.textContent = `${provider.publicKey.toBase58()} | ${sol.toFixed(4)} SOL`;
-      if (!els.recipient.value.trim()) {
-        els.recipient.value = provider.publicKey.toBase58();
-      }
     }
   } catch {
     // ignore
