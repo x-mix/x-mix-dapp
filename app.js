@@ -13,7 +13,7 @@ const DEFAULT_RPC =
   'https://solana-mainnet.core.chainstack.com/2cd2b649ac769bded1318e8af2508268';
 const DEFAULT_PROGRAM_ID = 'XmixQ4DB8MtKcEFhyjWs1gZtdaF3YDuF4ieGLJ3xotv';
 const DEFAULT_MINT = 'So11111111111111111111111111111111111111112';
-const DEFAULT_RELAYER_API = 'http://127.0.0.1:8787';
+const DEFAULT_RELAYER_API = 'https://api.xmix.dev';
 
 const TOKEN_PROGRAM_ID = new PublicKey(
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
