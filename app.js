@@ -5,9 +5,9 @@ import {
   Transaction,
   TransactionInstruction,
   LAMPORTS_PER_SOL,
-} from 'https://esm.sh/@solana/web3.js@1.98.4';
-import bs58 from 'https://esm.sh/bs58@6.0.0';
-import { buildPoseidon } from 'https://esm.sh/circomlibjs@0.1.7';
+} from '@solana/web3.js';
+import bs58 from 'bs58';
+import { buildPoseidon } from 'circomlibjs';
 
 const DEFAULT_RPC =
   'https://solana-mainnet.core.chainstack.com/2cd2b649ac769bded1318e8af2508268';

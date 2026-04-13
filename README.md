@@ -8,29 +8,35 @@ Standalone frontend for x-mix.
 - Input amount
 - Click `确认发送`
 
-The page will automatically:
-- send on-chain `deposit`
-- generate and show backup note
-- call relayer API `POST /api/relay-request/build`
+The page automatically:
+- sends on-chain `deposit`
+- generates a backup note
+- submits relayer request to `POST /api/relay-request/build`
 
-## Defaults
-- RPC: Chainstack mainnet endpoint
-- Program ID: `XmixQ4DB8MtKcEFhyjWs1gZtdaF3YDuF4ieGLJ3xotv`
-- Relayer API: `https://api.xmix.dev`
+## Stack
+- Vite build
+- Local npm dependencies (no `esm.sh` runtime imports)
 
-## Local run
+## Local development
 
 ```bash
 cd x-mix-dapp
-python3 -m http.server 4173
+npm install
+npm run dev
 ```
 
-Open: `http://127.0.0.1:4173`
+## Production build
 
-## Deploy to Vercel
+```bash
+npm run build
+npm run preview
+```
 
-1. Import this repository in Vercel.
-2. Framework preset: `Other`.
-3. Build command: leave empty.
-4. Output directory: leave empty.
-5. Deploy.
+## Vercel
+- Framework preset: `Vite`
+- Build command: `npm run build`
+- Output directory: `dist`
+
+## Default endpoints
+- Relayer API: `https://api.xmix.dev`
+- Program ID: `XmixQ4DB8MtKcEFhyjWs1gZtdaF3YDuF4ieGLJ3xotv`
