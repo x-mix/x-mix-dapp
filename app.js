@@ -7,6 +7,11 @@ import {
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
+import { Buffer } from 'buffer';
+
+if (!globalThis.Buffer) {
+  globalThis.Buffer = Buffer;
+}
 
 const DEFAULT_RPC =
   'https://solana-mainnet.core.chainstack.com/2cd2b649ac769bded1318e8af2508268';
