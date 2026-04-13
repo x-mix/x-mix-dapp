@@ -7,7 +7,6 @@ import {
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
-import { buildPoseidon } from 'circomlibjs';
 
 const DEFAULT_RPC =
   'https://solana-mainnet.core.chainstack.com/2cd2b649ac769bded1318e8af2508268';
@@ -60,7 +59,7 @@ let latestNote = null;
 boot();
 
 function boot() {
-  provider = getWalletProvider();
+  provider = resolveWalletProvider();
 
   els.connectBtn.addEventListener('click', onConnectWallet);
   els.sendBtn.addEventListener('click', onSend);
@@ -79,6 +78,11 @@ function getWalletProvider() {
   if (window?.phantom?.solana?.isPhantom) return window.phantom.solana;
   if (window?.solana?.isPhantom) return window.solana;
   return null;
+}
+
+function resolveWalletProvider() {
+  provider = getWalletProvider();
+  return provider;
 }
 
 function getConnection() {
@@ -117,13 +121,14 @@ function setProgress(stepEl, state) {
 
 async function onConnectWallet() {
   try {
-    if (!provider) throw new Error('未检测到 Phantom');
+    const currentProvider = resolveWalletProvider();
+    if (!currentProvider) throw new Error('未检测到 Phantom');
 
-    await provider.connect();
+    await currentProvider.connect();
 
-    const address = provider.publicKey.toBase58();
+    const address = currentProvider.publicKey.toBase58();
     const connection = getConnection();
-    const bal = await connection.getBalance(provider.publicKey, 'confirmed');
+    const bal = await connection.getBalance(currentProvider.publicKey, 'confirmed');
     const sol = Number(bal) / LAMPORTS_PER_SOL;
 
     els.walletStatus.textContent = `${address} | ${sol.toFixed(4)} SOL`;
@@ -181,7 +186,7 @@ function bigIntToBytes(value) {
 
 async function getPoseidon() {
   if (!poseidonPromise) {
-    poseidonPromise = buildPoseidon();
+    poseidonPromise = import('circomlibjs').then((m) => m.buildPoseidon());
   }
   return poseidonPromise;
 }
@@ -569,6 +574,7 @@ function onDownloadNote() {
 
 window.addEventListener('load', async () => {
   try {
+    resolveWalletProvider();
     if (provider?.isConnected && provider?.publicKey) {
       const connection = getConnection();
       const bal = await connection.getBalance(provider.publicKey, 'confirmed');
