@@ -476,26 +476,31 @@ async function sendDepositTransactions({ connection, walletPubkey, txs }) {
     return [];
   }
 
-  if (txs.length > 1 && typeof provider.signAllTransactions === 'function') {
-    const latest = await connection.getLatestBlockhash('confirmed');
+  const sendSequentially = async () => {
+    const signatures = [];
     for (const tx of txs) {
+      const latest = await connection.getLatestBlockhash('confirmed');
       tx.feePayer = walletPubkey;
       tx.recentBlockhash = latest.blockhash;
-    }
 
-    const signedTxs = await provider.signAllTransactions(txs);
-    const signatures = [];
+      let signature;
+      if (typeof provider.signAndSendTransaction === 'function') {
+        // eslint-disable-next-line no-await-in-loop
+        const res = await provider.signAndSendTransaction(tx);
+        signature = typeof res === 'string' ? res : res.signature;
+      } else if (typeof provider.signTransaction === 'function') {
+        // eslint-disable-next-line no-await-in-loop
+        const signed = await provider.signTransaction(tx);
+        // eslint-disable-next-line no-await-in-loop
+        signature = await connection.sendRawTransaction(signed.serialize());
+      } else {
+        throw new Error('钱包不支持 signAndSendTransaction/signTransaction');
+      }
 
-    for (const signedTx of signedTxs) {
-      // eslint-disable-next-line no-await-in-loop
-      const signature = await connection.sendRawTransaction(signedTx.serialize());
       if (!signature) {
         throw new Error('未获取到交易签名');
       }
-      signatures.push(signature);
-    }
 
-    for (const signature of signatures) {
       // eslint-disable-next-line no-await-in-loop
       await connection.confirmTransaction(
         {
@@ -505,49 +510,53 @@ async function sendDepositTransactions({ connection, walletPubkey, txs }) {
         },
         'confirmed'
       );
-    }
 
+      signatures.push(signature);
+    }
     return signatures;
+  };
+
+  if (txs.length > 1 && typeof provider.signAllTransactions === 'function') {
+    try {
+      const latest = await connection.getLatestBlockhash('confirmed');
+      for (const tx of txs) {
+        tx.feePayer = walletPubkey;
+        tx.recentBlockhash = latest.blockhash;
+      }
+
+      const signedTxs = await provider.signAllTransactions(txs);
+      const signatures = [];
+
+      for (const signedTx of signedTxs) {
+        // eslint-disable-next-line no-await-in-loop
+        const signature = await connection.sendRawTransaction(signedTx.serialize());
+        if (!signature) {
+          throw new Error('未获取到交易签名');
+        }
+        signatures.push(signature);
+      }
+
+      for (const signature of signatures) {
+        // eslint-disable-next-line no-await-in-loop
+        await connection.confirmTransaction(
+          {
+            signature,
+            blockhash: latest.blockhash,
+            lastValidBlockHeight: latest.lastValidBlockHeight,
+          },
+          'confirmed'
+        );
+      }
+
+      return signatures;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`钱包拦截批量签名，回退为逐笔签名: ${message}`, 'warn');
+      return sendSequentially();
+    }
   }
 
-  const signatures = [];
-  for (const tx of txs) {
-    const latest = await connection.getLatestBlockhash('confirmed');
-    tx.feePayer = walletPubkey;
-    tx.recentBlockhash = latest.blockhash;
-
-    let signature;
-    if (typeof provider.signAndSendTransaction === 'function') {
-      // eslint-disable-next-line no-await-in-loop
-      const res = await provider.signAndSendTransaction(tx);
-      signature = typeof res === 'string' ? res : res.signature;
-    } else if (typeof provider.signTransaction === 'function') {
-      // eslint-disable-next-line no-await-in-loop
-      const signed = await provider.signTransaction(tx);
-      // eslint-disable-next-line no-await-in-loop
-      signature = await connection.sendRawTransaction(signed.serialize());
-    } else {
-      throw new Error('钱包不支持 signAndSendTransaction/signTransaction');
-    }
-
-    if (!signature) {
-      throw new Error('未获取到交易签名');
-    }
-
-    // eslint-disable-next-line no-await-in-loop
-    await connection.confirmTransaction(
-      {
-        signature,
-        blockhash: latest.blockhash,
-        lastValidBlockHeight: latest.lastValidBlockHeight,
-      },
-      'confirmed'
-    );
-
-    signatures.push(signature);
-  }
-
-  return signatures;
+  return sendSequentially();
 }
 
 function sleep(ms) {
@@ -620,11 +629,7 @@ async function onSend() {
     els.txLink.textContent = '等待交易';
 
     if (targets.length > 1) {
-      if (typeof provider.signAllTransactions === 'function') {
-        log(`检测到批量目标 ${targets.length} 个，将进行一次钱包批量签名。`);
-      } else {
-        log(`检测到批量目标 ${targets.length} 个，当前钱包不支持批量签名，将逐笔确认。`, 'warn');
-      }
+      log(`检测到批量目标 ${targets.length} 个，将优先尝试单笔交易一次签名。`);
     }
 
     const connection = getConnection();
@@ -702,6 +707,7 @@ async function onSend() {
         secretHex: bytesToHex(secret),
         nullifierHex: bytesToHex(nullifier),
         depositSignature: '',
+        depositInstructionIndex: 1,
       };
 
       pendingDeposits.push({
@@ -712,21 +718,70 @@ async function onSend() {
       });
     }
 
-    log('提交 Deposit 交易到链上...');
-    const depositSignatures = await sendDepositTransactions({
-      connection,
-      walletPubkey: provider.publicKey,
-      txs: pendingDeposits.map((item) => item.tx),
-    });
+    if (pendingDeposits.length > 1) {
+      const combinedTx = new Transaction();
+      for (const item of pendingDeposits) {
+        const depositInstructionIndex = combinedTx.instructions.length + 1;
+        item.note.depositInstructionIndex = depositInstructionIndex;
+        for (const ix of item.tx.instructions) {
+          combinedTx.add(ix);
+        }
+      }
 
-    for (let i = 0; i < pendingDeposits.length; i += 1) {
-      const signature = depositSignatures[i];
-      const item = pendingDeposits[i];
+      try {
+        log('提交单笔批量 Deposit 交易到链上...');
+        const [combinedSignature] = await sendDepositTransactions({
+          connection,
+          walletPubkey: provider.publicKey,
+          txs: [combinedTx],
+        });
+
+        for (const item of pendingDeposits) {
+          item.note.depositSignature = combinedSignature;
+          els.txLink.href = `https://solscan.io/tx/${combinedSignature}`;
+          els.txLink.textContent = combinedSignature;
+          log(
+            `${item.prefix}Deposit 成功: ${combinedSignature} (ix=${item.note.depositInstructionIndex})`
+          );
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        log(`单笔批量交易失败，回退为多笔发送: ${reason}`, 'warn');
+
+        for (const item of pendingDeposits) {
+          item.note.depositInstructionIndex = 1;
+        }
+
+        const depositSignatures = await sendDepositTransactions({
+          connection,
+          walletPubkey: provider.publicKey,
+          txs: pendingDeposits.map((item) => item.tx),
+        });
+
+        for (let i = 0; i < pendingDeposits.length; i += 1) {
+          const signature = depositSignatures[i];
+          const item = pendingDeposits[i];
+          item.note.depositSignature = signature;
+
+          els.txLink.href = `https://solscan.io/tx/${signature}`;
+          els.txLink.textContent = signature;
+          log(`${item.prefix}Deposit 成功: ${signature} (ix=1)`);
+        }
+      }
+    } else {
+      log('提交 Deposit 交易到链上...');
+      const [signature] = await sendDepositTransactions({
+        connection,
+        walletPubkey: provider.publicKey,
+        txs: [pendingDeposits[0].tx],
+      });
+
+      const item = pendingDeposits[0];
       item.note.depositSignature = signature;
-
+      item.note.depositInstructionIndex = 1;
       els.txLink.href = `https://solscan.io/tx/${signature}`;
       els.txLink.textContent = signature;
-      log(`${item.prefix}Deposit 成功: ${signature}`);
+      log(`${item.prefix}Deposit 成功: ${signature} (ix=1)`);
     }
 
     setProgress(els.stepDeposit, 'done');
