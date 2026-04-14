@@ -74,6 +74,7 @@ function boot() {
 
   els.connectBtn.addEventListener('click', onConnectWallet);
   els.sendBtn.addEventListener('click', onSend);
+  els.recipient.addEventListener('input', syncSendButtonState);
   els.amountSol.addEventListener('input', syncSendButtonState);
   els.copyNoteBtn.addEventListener('click', onCopyNote);
   els.downloadNoteBtn.addEventListener('click', onDownloadNote);
@@ -181,9 +182,74 @@ function isAmountSendable(raw) {
 }
 
 function syncSendButtonState() {
+  const hasRecipient = Boolean(els.recipient.value.trim());
   const amountOk = isAmountSendable(els.amountSol.value);
-  els.sendBtn.disabled = busy || !amountOk;
-  els.sendBtn.title = amountOk ? "" : "最低发送金额 " + MIN_SOL_DEPOSIT_TEXT + " SOL";
+  const canSend = hasRecipient && amountOk;
+  els.sendBtn.disabled = busy || !canSend;
+
+  if (!hasRecipient) {
+    els.sendBtn.title = '请填写收币地址';
+    return;
+  }
+  els.sendBtn.title = amountOk ? '' : '最低发送金额 ' + MIN_SOL_DEPOSIT_TEXT + ' SOL';
+}
+
+function parseRecipientTargets(rawRecipients, defaultAmountText) {
+  const lines = rawRecipients
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    throw new Error('请填写收币地址。');
+  }
+
+  const out = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].replaceAll('，', ',');
+    let recipient = '';
+    let amountText = defaultAmountText.trim();
+
+    if (line.includes(',')) {
+      const parts = line.split(',').map((v) => v.trim()).filter(Boolean);
+      if (parts.length < 1 || parts.length > 2) {
+        throw new Error(`第 ${i + 1} 行格式错误，示例：地址 或 地址,金额`);
+      }
+      recipient = parts[0];
+      if (parts[1]) {
+        amountText = parts[1];
+      }
+    } else {
+      const parts = line.split(/\s+/).filter(Boolean);
+      if (parts.length === 1) {
+        recipient = parts[0];
+      } else if (parts.length === 2 && /^\d+(\.\d+)?$/.test(parts[1])) {
+        recipient = parts[0];
+        amountText = parts[1];
+      } else {
+        throw new Error(`第 ${i + 1} 行格式错误，示例：地址 或 地址,金额`);
+      }
+    }
+
+    let recipientPk;
+    try {
+      recipientPk = new PublicKey(recipient);
+    } catch {
+      throw new Error(`第 ${i + 1} 行收币地址格式错误`);
+    }
+
+    const amountLamports = parseSolToLamports(amountText);
+    if (amountLamports < MIN_SOL_DEPOSIT_LAMPORTS) {
+      throw new Error(`第 ${i + 1} 行金额低于最低 ${MIN_SOL_DEPOSIT_TEXT} SOL`);
+    }
+
+    out.push({
+      recipient: recipientPk.toBase58(),
+      amountLamports,
+    });
+  }
+
+  return out;
 }
 
 function bytesToHex(bytes) {
@@ -490,29 +556,11 @@ async function onSend() {
     return;
   }
 
-  const recipient = els.recipient.value.trim();
-  if (!recipient) {
-    log('请填写收币地址。', 'warn');
-    return;
-  }
-
+  let targets;
   try {
-    new PublicKey(recipient);
-  } catch {
-    log('收币地址格式错误。', 'warn');
-    return;
-  }
-
-  let amountLamports;
-  try {
-    amountLamports = parseSolToLamports(els.amountSol.value);
+    targets = parseRecipientTargets(els.recipient.value, els.amountSol.value);
   } catch (error) {
     log(error instanceof Error ? error.message : String(error), 'warn');
-    return;
-  }
-
-  if (amountLamports < MIN_SOL_DEPOSIT_LAMPORTS) {
-    log('最低发送金额为 ' + MIN_SOL_DEPOSIT_TEXT + ' SOL。', 'warn');
     return;
   }
 
@@ -523,84 +571,116 @@ async function onSend() {
     els.txLink.href = '#';
     els.txLink.textContent = '等待交易';
 
+    if (targets.length > 1) {
+      log(`检测到批量目标 ${targets.length} 个，将逐笔提交。`);
+    }
+
     const connection = getConnection();
     const programId = getProgramId();
     const mintPk = new PublicKey(DEFAULT_MINT);
     const { pool, vault } = derivePoolAndVault(programId, mintPk, ASSET_TYPE_SOL);
+    const noteEntries = [];
+    const requestIds = [];
 
-    setProgress(els.stepDeposit, 'running');
-    log('开始构建 Deposit...');
+    for (let i = 0; i < targets.length; i += 1) {
+      const target = targets[i];
+      const prefix = targets.length > 1 ? `[${i + 1}/${targets.length}] ` : '';
 
-    const secret = random32Bytes();
-    const nullifier = random32Bytes();
-    const commitment = await generateCommitment(secret, nullifier, amountLamports, pool);
+      setProgress(els.stepDeposit, 'running');
+      log(`${prefix}开始构建 Deposit...`);
 
-    log('扫描历史 Deposit，重建最新 Merkle Root...');
-    const oldCommitments = await fetchPoolCommitments(connection, programId, pool, SCAN_LIMIT);
-    const newRoot = await computeMerkleRoot([...oldCommitments, commitment]);
+      const secret = random32Bytes();
+      const nullifier = random32Bytes();
+      const commitment = await generateCommitment(secret, nullifier, target.amountLamports, pool);
 
-    const totalUserOutflowLamports = amountLamports + RELAYER_EXECUTION_FEE_LAMPORTS;
-    log(
-      `发送链上 Deposit 交易（存款 ${(
-        Number(amountLamports) / LAMPORTS_PER_SOL
-      ).toFixed(9)} SOL + 中继执行费 ${(
-        Number(RELAYER_EXECUTION_FEE_LAMPORTS) / LAMPORTS_PER_SOL
-      ).toFixed(9)} SOL）...`
-    );
-    const signature = await sendDepositTx({
-      connection,
-      walletPubkey: provider.publicKey,
-      amountLamports,
-      commitment,
-      newRoot,
-      poolPk: pool,
-      vaultPk: vault,
-    });
+      log(`${prefix}扫描历史 Deposit，重建最新 Merkle Root...`);
+      // eslint-disable-next-line no-await-in-loop
+      const oldCommitments = await fetchPoolCommitments(connection, programId, pool, SCAN_LIMIT);
+      const newRoot = await computeMerkleRoot([...oldCommitments, commitment]);
 
-    setProgress(els.stepDeposit, 'done');
-    els.txLink.href = `https://solscan.io/tx/${signature}`;
-    els.txLink.textContent = signature;
-    log(`Deposit 成功: ${signature}`);
+      const totalUserOutflowLamports =
+        target.amountLamports + RELAYER_EXECUTION_FEE_LAMPORTS;
+      log(
+        `${prefix}发送链上 Deposit 交易（存款 ${(
+          Number(target.amountLamports) / LAMPORTS_PER_SOL
+        ).toFixed(9)} SOL + 中继执行费 ${(
+          Number(RELAYER_EXECUTION_FEE_LAMPORTS) / LAMPORTS_PER_SOL
+        ).toFixed(9)} SOL）...`
+      );
+      // eslint-disable-next-line no-await-in-loop
+      const signature = await sendDepositTx({
+        connection,
+        walletPubkey: provider.publicKey,
+        amountLamports: target.amountLamports,
+        commitment,
+        newRoot,
+        poolPk: pool,
+        vaultPk: vault,
+      });
 
-    const note = {
-      version: 1,
-      createdAt: new Date().toISOString(),
-      rpcUrl: DEFAULT_RPC,
-      programId: programId.toBase58(),
-      pool: pool.toBase58(),
-      vault: vault.toBase58(),
-      mint: mintPk.toBase58(),
-      assetType: 'sol',
-      amountLamports: amountLamports.toString(),
-      amountSol: (Number(amountLamports) / LAMPORTS_PER_SOL).toString(),
-      relayerExecutionFeeLamports: RELAYER_EXECUTION_FEE_LAMPORTS.toString(),
-      relayerExecutionFeeSol: (
-        Number(RELAYER_EXECUTION_FEE_LAMPORTS) / LAMPORTS_PER_SOL
-      ).toString(),
-      totalUserOutflowLamports: totalUserOutflowLamports.toString(),
-      totalUserOutflowSol: (
-        Number(totalUserOutflowLamports) / LAMPORTS_PER_SOL
-      ).toString(),
-      relayerExecutor: DEFAULT_RELAYER_EXECUTOR,
-      commitmentHex: bytesToHex(commitment),
-      newRootHex: bytesToHex(newRoot),
-      secretHex: bytesToHex(secret),
-      nullifierHex: bytesToHex(nullifier),
-      depositSignature: signature,
-    };
+      setProgress(els.stepDeposit, 'done');
+      els.txLink.href = `https://solscan.io/tx/${signature}`;
+      els.txLink.textContent = signature;
+      log(`${prefix}Deposit 成功: ${signature}`);
 
-    latestNote = note;
-    els.note.value = JSON.stringify(note, null, 2);
+      const note = {
+        version: 1,
+        createdAt: new Date().toISOString(),
+        rpcUrl: DEFAULT_RPC,
+        programId: programId.toBase58(),
+        pool: pool.toBase58(),
+        vault: vault.toBase58(),
+        mint: mintPk.toBase58(),
+        assetType: 'sol',
+        recipient: target.recipient,
+        amountLamports: target.amountLamports.toString(),
+        amountSol: (Number(target.amountLamports) / LAMPORTS_PER_SOL).toString(),
+        relayerExecutionFeeLamports: RELAYER_EXECUTION_FEE_LAMPORTS.toString(),
+        relayerExecutionFeeSol: (
+          Number(RELAYER_EXECUTION_FEE_LAMPORTS) / LAMPORTS_PER_SOL
+        ).toString(),
+        totalUserOutflowLamports: totalUserOutflowLamports.toString(),
+        totalUserOutflowSol: (
+          Number(totalUserOutflowLamports) / LAMPORTS_PER_SOL
+        ).toString(),
+        relayerExecutor: DEFAULT_RELAYER_EXECUTOR,
+        commitmentHex: bytesToHex(commitment),
+        newRootHex: bytesToHex(newRoot),
+        secretHex: bytesToHex(secret),
+        nullifierHex: bytesToHex(nullifier),
+        depositSignature: signature,
+      };
 
-    setProgress(els.stepRequest, 'running');
-    log('提交 Withdraw 请求到 relayer...');
-    const req = await buildWithdrawRequest(note, recipient);
+      setProgress(els.stepRequest, 'running');
+      log(`${prefix}提交 Withdraw 请求到 relayer...`);
+      // eslint-disable-next-line no-await-in-loop
+      const req = await buildWithdrawRequest(note, target.recipient);
 
-    setProgress(els.stepRequest, 'done');
+      setProgress(els.stepRequest, 'done');
+      const requestId = req.requestId ?? '-';
+      requestIds.push(requestId);
+      noteEntries.push({ ...note, requestId });
+      log(`${prefix}请求已入队: ${requestId}`);
+    }
+
     setProgress(els.stepDone, 'done');
-    els.requestId.textContent = req.requestId ?? '-';
+    els.requestId.textContent =
+      requestIds.length === 1 ? requestIds[0] : `${requestIds.length} requests`;
 
-    log(`请求已入队: ${req.requestId}`);
+    if (noteEntries.length === 1) {
+      latestNote = noteEntries[0];
+      els.note.value = JSON.stringify(noteEntries[0], null, 2);
+    } else {
+      latestNote = {
+        version: 1,
+        mode: 'batch',
+        createdAt: new Date().toISOString(),
+        count: noteEntries.length,
+        entries: noteEntries,
+      };
+      els.note.value = JSON.stringify(latestNote, null, 2);
+    }
+
     log('流程完成。请等待 relayer 执行 transfer。');
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -641,7 +721,12 @@ function onDownloadNote() {
     const url = URL.createObjectURL(file);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `x-mix-note-${latestNote.depositSignature.slice(0, 10)}.json`;
+    const suffix = latestNote.depositSignature
+      ? latestNote.depositSignature.slice(0, 10)
+      : latestNote.mode === 'batch' && Array.isArray(latestNote.entries)
+        ? `batch-${latestNote.entries.length}`
+        : 'export';
+    a.download = `x-mix-note-${suffix}.json`;
     document.body.appendChild(a);
     a.click();
     a.remove();

@@ -36,11 +36,15 @@
       <section class="card action-card">
         <h2>发送参数</h2>
         <label>
-          <span>收币地址</span>
-          <input id="recipient" type="text" placeholder="输入接收地址" autocomplete="off" />
+          <span>收币地址（支持批量）</span>
+          <textarea
+            id="recipient"
+            rows="4"
+            placeholder="一行一个地址，或 地址,金额&#10;例如：&#10;9RCu7f...WTQr&#10;7GwEXx...Qfwft,0.2"
+          ></textarea>
         </label>
         <label>
-          <span>转账金额 (SOL)</span>
+          <span>默认转账金额 (SOL)</span>
           <input id="amountSol" type="text" value="0.1" autocomplete="off" />
         </label>
 
