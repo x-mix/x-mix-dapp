@@ -29,6 +29,7 @@ const REQUEST_RETRY_ATTEMPTS = 8;
 const REQUEST_RETRY_WAIT_MS = 4000;
 const MIN_SOL_DEPOSIT_LAMPORTS = 50_000_000n;
 const MIN_SOL_DEPOSIT_TEXT = '0.05';
+const MAX_RECIPIENTS_PER_DEPOSIT_TX = 7;
 
 const TOKEN_PROGRAM_ID = new PublicKey(
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
@@ -629,7 +630,14 @@ async function onSend() {
     els.txLink.textContent = '等待交易';
 
     if (targets.length > 1) {
-      log(`检测到批量目标 ${targets.length} 个，将优先尝试单笔交易一次签名。`);
+      const batchCount = Math.ceil(targets.length / MAX_RECIPIENTS_PER_DEPOSIT_TX);
+      if (batchCount === 1) {
+        log(`检测到批量目标 ${targets.length} 个，将优先尝试单笔交易一次签名。`);
+      } else {
+        log(
+          `检测到批量目标 ${targets.length} 个，超过单笔上限，将自动拆分为 ${batchCount} 批（每批最多 ${MAX_RECIPIENTS_PER_DEPOSIT_TX} 个地址）。`
+        );
+      }
     }
 
     const connection = getConnection();
@@ -719,30 +727,47 @@ async function onSend() {
     }
 
     if (pendingDeposits.length > 1) {
-      const combinedTx = new Transaction();
-      for (const item of pendingDeposits) {
-        const depositInstructionIndex = combinedTx.instructions.length + 1;
-        item.note.depositInstructionIndex = depositInstructionIndex;
-        for (const ix of item.tx.instructions) {
-          combinedTx.add(ix);
+      const depositBatches = [];
+      for (
+        let start = 0;
+        start < pendingDeposits.length;
+        start += MAX_RECIPIENTS_PER_DEPOSIT_TX
+      ) {
+        const items = pendingDeposits.slice(start, start + MAX_RECIPIENTS_PER_DEPOSIT_TX);
+        const tx = new Transaction();
+        for (const item of items) {
+          const depositInstructionIndex = tx.instructions.length + 1;
+          item.note.depositInstructionIndex = depositInstructionIndex;
+          for (const ix of item.tx.instructions) {
+            tx.add(ix);
+          }
         }
+        depositBatches.push({ tx, items });
       }
 
       try {
-        log('提交单笔批量 Deposit 交易到链上...');
-        const [combinedSignature] = await sendDepositTransactions({
+        log(
+          depositBatches.length === 1
+            ? '提交单笔批量 Deposit 交易到链上...'
+            : `提交 ${depositBatches.length} 笔批量 Deposit 交易到链上...`
+        );
+        const batchSignatures = await sendDepositTransactions({
           connection,
           walletPubkey: provider.publicKey,
-          txs: [combinedTx],
+          txs: depositBatches.map((batch) => batch.tx),
         });
 
-        for (const item of pendingDeposits) {
-          item.note.depositSignature = combinedSignature;
-          els.txLink.href = `https://solscan.io/tx/${combinedSignature}`;
-          els.txLink.textContent = combinedSignature;
-          log(
-            `${item.prefix}Deposit 成功: ${combinedSignature} (ix=${item.note.depositInstructionIndex})`
-          );
+        for (let batchIdx = 0; batchIdx < depositBatches.length; batchIdx += 1) {
+          const signature = batchSignatures[batchIdx];
+          const batch = depositBatches[batchIdx];
+          for (const item of batch.items) {
+            item.note.depositSignature = signature;
+            els.txLink.href = `https://solscan.io/tx/${signature}`;
+            els.txLink.textContent = signature;
+            log(
+              `${item.prefix}Deposit 成功: ${signature} (ix=${item.note.depositInstructionIndex})`
+            );
+          }
         }
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
