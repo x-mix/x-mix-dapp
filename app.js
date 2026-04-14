@@ -125,6 +125,26 @@ function persistLatestNote() {
   }
 }
 
+function clearLatestNoteDraftStorage() {
+  try {
+    localStorage.removeItem(NOTE_DRAFT_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function hasValidRequestId(value) {
+  return typeof value === 'string' && value.trim() !== '' && value !== '-';
+}
+
+function isCompletedNoteDraft(note) {
+  if (!note || typeof note !== 'object') return false;
+  if (note.mode === 'batch' && Array.isArray(note.entries)) {
+    return note.entries.length > 0 && note.entries.every((entry) => hasValidRequestId(entry?.requestId));
+  }
+  return hasValidRequestId(note.requestId);
+}
+
 function syncNoteView() {
   if (!latestNote) return;
   els.note.value = JSON.stringify(latestNote, null, 2);
@@ -137,9 +157,13 @@ function restoreLatestNoteFromStorage() {
     if (!raw) return;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') return;
+    if (isCompletedNoteDraft(parsed)) {
+      clearLatestNoteDraftStorage();
+      return;
+    }
     latestNote = parsed;
     syncNoteView();
-    log('已恢复上次流程的 Note 草稿。', 'warn');
+    log('已恢复上次流程的 Note 草稿。');
   } catch {
     // ignore
   }
@@ -951,6 +975,7 @@ async function onSend() {
     els.requestId.textContent =
       requestIds.length === 1 ? requestIds[0] : `${requestIds.length} requests`;
     syncCurrentFlowNote();
+    clearLatestNoteDraftStorage();
 
     log('流程完成。请等待 relayer 执行 transfer。');
   } catch (error) {
