@@ -18,10 +18,13 @@ const DEFAULT_RPC =
 const DEFAULT_PROGRAM_ID = 'XmixQ4DB8MtKcEFhyjWs1gZtdaF3YDuF4ieGLJ3xotv';
 const DEFAULT_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_RELAYER_API = 'https://api.xmix.dev';
+const DEFAULT_RELAYER_EXECUTOR = 'xxxXGCRExgFF2EEWKU1QDDDYBL6Ma2X299ynEgEVff5';
 
 const ASSET_TYPE_SOL = 0;
 const SCAN_LIMIT = 220;
 const RELAYER_FEE_LAMPORTS = '0';
+// User-paid execution subsidy (A -> relayer) to cover relayer tx fee and nullifier rent.
+const RELAYER_EXECUTION_FEE_LAMPORTS = 1_230_960n;
 const REQUEST_RETRY_ATTEMPTS = 8;
 const REQUEST_RETRY_WAIT_MS = 4000;
 const MIN_SOL_DEPOSIT_LAMPORTS = 50_000_000n;
@@ -360,9 +363,18 @@ function encodeDepositData(amountLamports, commitment, newRoot) {
   return data;
 }
 
-async function sendDepositTx({ connection, walletPubkey, amountLamports, commitment, newRoot, poolPk, vaultPk }) {
+async function sendDepositTx({
+  connection,
+  walletPubkey,
+  amountLamports,
+  commitment,
+  newRoot,
+  poolPk,
+  vaultPk,
+}) {
   const programId = getProgramId();
   const mintPk = new PublicKey(DEFAULT_MINT);
+  const relayerExecutor = new PublicKey(DEFAULT_RELAYER_EXECUTOR);
 
   const ixData = encodeDepositData(amountLamports, commitment, newRoot);
 
@@ -385,7 +397,13 @@ async function sendDepositTx({ connection, walletPubkey, amountLamports, commitm
     data: ixData,
   });
 
-  const tx = new Transaction().add(ix);
+  const relayerExecutionFeeIx = SystemProgram.transfer({
+    fromPubkey: walletPubkey,
+    toPubkey: relayerExecutor,
+    lamports: Number(RELAYER_EXECUTION_FEE_LAMPORTS),
+  });
+
+  const tx = new Transaction().add(relayerExecutionFeeIx, ix);
   tx.feePayer = walletPubkey;
 
   const latest = await connection.getLatestBlockhash('confirmed');
@@ -521,7 +539,14 @@ async function onSend() {
     const oldCommitments = await fetchPoolCommitments(connection, programId, pool, SCAN_LIMIT);
     const newRoot = await computeMerkleRoot([...oldCommitments, commitment]);
 
-    log('发送链上 Deposit 交易...');
+    const totalUserOutflowLamports = amountLamports + RELAYER_EXECUTION_FEE_LAMPORTS;
+    log(
+      `发送链上 Deposit 交易（存款 ${(
+        Number(amountLamports) / LAMPORTS_PER_SOL
+      ).toFixed(9)} SOL + 中继执行费 ${(
+        Number(RELAYER_EXECUTION_FEE_LAMPORTS) / LAMPORTS_PER_SOL
+      ).toFixed(9)} SOL）...`
+    );
     const signature = await sendDepositTx({
       connection,
       walletPubkey: provider.publicKey,
@@ -548,6 +573,15 @@ async function onSend() {
       assetType: 'sol',
       amountLamports: amountLamports.toString(),
       amountSol: (Number(amountLamports) / LAMPORTS_PER_SOL).toString(),
+      relayerExecutionFeeLamports: RELAYER_EXECUTION_FEE_LAMPORTS.toString(),
+      relayerExecutionFeeSol: (
+        Number(RELAYER_EXECUTION_FEE_LAMPORTS) / LAMPORTS_PER_SOL
+      ).toString(),
+      totalUserOutflowLamports: totalUserOutflowLamports.toString(),
+      totalUserOutflowSol: (
+        Number(totalUserOutflowLamports) / LAMPORTS_PER_SOL
+      ).toString(),
+      relayerExecutor: DEFAULT_RELAYER_EXECUTOR,
       commitmentHex: bytesToHex(commitment),
       newRootHex: bytesToHex(newRoot),
       secretHex: bytesToHex(secret),
