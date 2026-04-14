@@ -429,8 +429,7 @@ function encodeDepositData(amountLamports, commitment, newRoot) {
   return data;
 }
 
-async function sendDepositTx({
-  connection,
+function createDepositTx({
   walletPubkey,
   amountLamports,
   commitment,
@@ -469,37 +468,86 @@ async function sendDepositTx({
     lamports: Number(RELAYER_EXECUTION_FEE_LAMPORTS),
   });
 
-  const tx = new Transaction().add(relayerExecutionFeeIx, ix);
-  tx.feePayer = walletPubkey;
+  return new Transaction().add(relayerExecutionFeeIx, ix);
+}
 
-  const latest = await connection.getLatestBlockhash('confirmed');
-  tx.recentBlockhash = latest.blockhash;
-
-  let signature;
-  if (typeof provider.signAndSendTransaction === 'function') {
-    const res = await provider.signAndSendTransaction(tx);
-    signature = typeof res === 'string' ? res : res.signature;
-  } else if (typeof provider.signTransaction === 'function') {
-    const signed = await provider.signTransaction(tx);
-    signature = await connection.sendRawTransaction(signed.serialize());
-  } else {
-    throw new Error('钱包不支持 signAndSendTransaction/signTransaction');
+async function sendDepositTransactions({ connection, walletPubkey, txs }) {
+  if (txs.length === 0) {
+    return [];
   }
 
-  if (!signature) {
-    throw new Error('未获取到交易签名');
+  if (txs.length > 1 && typeof provider.signAllTransactions === 'function') {
+    const latest = await connection.getLatestBlockhash('confirmed');
+    for (const tx of txs) {
+      tx.feePayer = walletPubkey;
+      tx.recentBlockhash = latest.blockhash;
+    }
+
+    const signedTxs = await provider.signAllTransactions(txs);
+    const signatures = [];
+
+    for (const signedTx of signedTxs) {
+      // eslint-disable-next-line no-await-in-loop
+      const signature = await connection.sendRawTransaction(signedTx.serialize());
+      if (!signature) {
+        throw new Error('未获取到交易签名');
+      }
+      signatures.push(signature);
+    }
+
+    for (const signature of signatures) {
+      // eslint-disable-next-line no-await-in-loop
+      await connection.confirmTransaction(
+        {
+          signature,
+          blockhash: latest.blockhash,
+          lastValidBlockHeight: latest.lastValidBlockHeight,
+        },
+        'confirmed'
+      );
+    }
+
+    return signatures;
   }
 
-  await connection.confirmTransaction(
-    {
-      signature,
-      blockhash: latest.blockhash,
-      lastValidBlockHeight: latest.lastValidBlockHeight,
-    },
-    'confirmed'
-  );
+  const signatures = [];
+  for (const tx of txs) {
+    const latest = await connection.getLatestBlockhash('confirmed');
+    tx.feePayer = walletPubkey;
+    tx.recentBlockhash = latest.blockhash;
 
-  return signature;
+    let signature;
+    if (typeof provider.signAndSendTransaction === 'function') {
+      // eslint-disable-next-line no-await-in-loop
+      const res = await provider.signAndSendTransaction(tx);
+      signature = typeof res === 'string' ? res : res.signature;
+    } else if (typeof provider.signTransaction === 'function') {
+      // eslint-disable-next-line no-await-in-loop
+      const signed = await provider.signTransaction(tx);
+      // eslint-disable-next-line no-await-in-loop
+      signature = await connection.sendRawTransaction(signed.serialize());
+    } else {
+      throw new Error('钱包不支持 signAndSendTransaction/signTransaction');
+    }
+
+    if (!signature) {
+      throw new Error('未获取到交易签名');
+    }
+
+    // eslint-disable-next-line no-await-in-loop
+    await connection.confirmTransaction(
+      {
+        signature,
+        blockhash: latest.blockhash,
+        lastValidBlockHeight: latest.lastValidBlockHeight,
+      },
+      'confirmed'
+    );
+
+    signatures.push(signature);
+  }
+
+  return signatures;
 }
 
 function sleep(ms) {
@@ -572,44 +620,54 @@ async function onSend() {
     els.txLink.textContent = '等待交易';
 
     if (targets.length > 1) {
-      log(`检测到批量目标 ${targets.length} 个，将逐笔提交。`);
+      if (typeof provider.signAllTransactions === 'function') {
+        log(`检测到批量目标 ${targets.length} 个，将进行一次钱包批量签名。`);
+      } else {
+        log(`检测到批量目标 ${targets.length} 个，当前钱包不支持批量签名，将逐笔确认。`, 'warn');
+      }
     }
 
     const connection = getConnection();
     const programId = getProgramId();
     const mintPk = new PublicKey(DEFAULT_MINT);
     const { pool, vault } = derivePoolAndVault(programId, mintPk, ASSET_TYPE_SOL);
+    const pendingDeposits = [];
     const noteEntries = [];
     const requestIds = [];
+
+    setProgress(els.stepDeposit, 'running');
+    log('扫描历史 Deposit，重建最新 Merkle Root...');
+    const historicalCommitments = await fetchPoolCommitments(
+      connection,
+      programId,
+      pool,
+      SCAN_LIMIT
+    );
+    const commitmentsForBatch = [...historicalCommitments];
 
     for (let i = 0; i < targets.length; i += 1) {
       const target = targets[i];
       const prefix = targets.length > 1 ? `[${i + 1}/${targets.length}] ` : '';
 
-      setProgress(els.stepDeposit, 'running');
       log(`${prefix}开始构建 Deposit...`);
 
       const secret = random32Bytes();
       const nullifier = random32Bytes();
       const commitment = await generateCommitment(secret, nullifier, target.amountLamports, pool);
-
-      log(`${prefix}扫描历史 Deposit，重建最新 Merkle Root...`);
-      // eslint-disable-next-line no-await-in-loop
-      const oldCommitments = await fetchPoolCommitments(connection, programId, pool, SCAN_LIMIT);
-      const newRoot = await computeMerkleRoot([...oldCommitments, commitment]);
+      const newRoot = await computeMerkleRoot([...commitmentsForBatch, commitment]);
+      commitmentsForBatch.push(commitment);
 
       const totalUserOutflowLamports =
         target.amountLamports + RELAYER_EXECUTION_FEE_LAMPORTS;
       log(
-        `${prefix}发送链上 Deposit 交易（存款 ${(
+        `${prefix}构建链上 Deposit 交易（存款 ${(
           Number(target.amountLamports) / LAMPORTS_PER_SOL
         ).toFixed(9)} SOL + 中继执行费 ${(
           Number(RELAYER_EXECUTION_FEE_LAMPORTS) / LAMPORTS_PER_SOL
         ).toFixed(9)} SOL）...`
       );
-      // eslint-disable-next-line no-await-in-loop
-      const signature = await sendDepositTx({
-        connection,
+
+      const tx = createDepositTx({
         walletPubkey: provider.publicKey,
         amountLamports: target.amountLamports,
         commitment,
@@ -617,11 +675,6 @@ async function onSend() {
         poolPk: pool,
         vaultPk: vault,
       });
-
-      setProgress(els.stepDeposit, 'done');
-      els.txLink.href = `https://solscan.io/tx/${signature}`;
-      els.txLink.textContent = signature;
-      log(`${prefix}Deposit 成功: ${signature}`);
 
       const note = {
         version: 1,
@@ -648,21 +701,49 @@ async function onSend() {
         newRootHex: bytesToHex(newRoot),
         secretHex: bytesToHex(secret),
         nullifierHex: bytesToHex(nullifier),
-        depositSignature: signature,
+        depositSignature: '',
       };
 
-      setProgress(els.stepRequest, 'running');
-      log(`${prefix}提交 Withdraw 请求到 relayer...`);
-      // eslint-disable-next-line no-await-in-loop
-      const req = await buildWithdrawRequest(note, target.recipient);
-
-      setProgress(els.stepRequest, 'done');
-      const requestId = req.requestId ?? '-';
-      requestIds.push(requestId);
-      noteEntries.push({ ...note, requestId });
-      log(`${prefix}请求已入队: ${requestId}`);
+      pendingDeposits.push({
+        prefix,
+        target,
+        note,
+        tx,
+      });
     }
 
+    log('提交 Deposit 交易到链上...');
+    const depositSignatures = await sendDepositTransactions({
+      connection,
+      walletPubkey: provider.publicKey,
+      txs: pendingDeposits.map((item) => item.tx),
+    });
+
+    for (let i = 0; i < pendingDeposits.length; i += 1) {
+      const signature = depositSignatures[i];
+      const item = pendingDeposits[i];
+      item.note.depositSignature = signature;
+
+      els.txLink.href = `https://solscan.io/tx/${signature}`;
+      els.txLink.textContent = signature;
+      log(`${item.prefix}Deposit 成功: ${signature}`);
+    }
+
+    setProgress(els.stepDeposit, 'done');
+    setProgress(els.stepRequest, 'running');
+
+    for (const item of pendingDeposits) {
+      log(`${item.prefix}提交 Withdraw 请求到 relayer...`);
+      // eslint-disable-next-line no-await-in-loop
+      const req = await buildWithdrawRequest(item.note, item.target.recipient);
+
+      const requestId = req.requestId ?? '-';
+      requestIds.push(requestId);
+      noteEntries.push({ ...item.note, requestId });
+      log(`${item.prefix}请求已入队: ${requestId}`);
+    }
+
+    setProgress(els.stepRequest, 'done');
     setProgress(els.stepDone, 'done');
     els.requestId.textContent =
       requestIds.length === 1 ? requestIds[0] : `${requestIds.length} requests`;
