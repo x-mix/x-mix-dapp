@@ -30,6 +30,7 @@ const REQUEST_RETRY_WAIT_MS = 4000;
 const MIN_SOL_DEPOSIT_LAMPORTS = 50_000_000n;
 const MIN_SOL_DEPOSIT_TEXT = '0.05';
 const MAX_RECIPIENTS_PER_DEPOSIT_TX = 7;
+const NOTE_DRAFT_STORAGE_KEY = 'xmix_note_draft_v1';
 
 const TOKEN_PROGRAM_ID = new PublicKey(
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
@@ -86,6 +87,7 @@ function boot() {
 
   resetProgress();
   syncSendButtonState();
+  restoreLatestNoteFromStorage();
   log('准备就绪。');
 }
 
@@ -112,6 +114,35 @@ function log(message, level = 'info') {
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const prefix = level === 'error' ? '[ERR]' : level === 'warn' ? '[WARN]' : '[INFO]';
   els.logBox.textContent = `${prefix} ${ts} ${message}\n${els.logBox.textContent}`;
+}
+
+function persistLatestNote() {
+  try {
+    if (!latestNote) return;
+    localStorage.setItem(NOTE_DRAFT_STORAGE_KEY, JSON.stringify(latestNote));
+  } catch {
+    // ignore
+  }
+}
+
+function syncNoteView() {
+  if (!latestNote) return;
+  els.note.value = JSON.stringify(latestNote, null, 2);
+  persistLatestNote();
+}
+
+function restoreLatestNoteFromStorage() {
+  try {
+    const raw = localStorage.getItem(NOTE_DRAFT_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return;
+    latestNote = parsed;
+    syncNoteView();
+    log('已恢复上次流程的 Note 草稿。', 'warn');
+  } catch {
+    // ignore
+  }
 }
 
 function setBusy(nextBusy) {
@@ -697,8 +728,24 @@ async function onSend() {
     const mintPk = new PublicKey(DEFAULT_MINT);
     const { pool, vault } = derivePoolAndVault(programId, mintPk, ASSET_TYPE_SOL);
     const pendingDeposits = [];
-    const noteEntries = [];
     const requestIds = [];
+    const flowNoteCreatedAt = new Date().toISOString();
+    const syncCurrentFlowNote = () => {
+      const entries = pendingDeposits.map((item) => ({ ...item.note }));
+      if (entries.length === 0) return;
+      if (entries.length === 1) {
+        latestNote = entries[0];
+      } else {
+        latestNote = {
+          version: 1,
+          mode: 'batch',
+          createdAt: flowNoteCreatedAt,
+          count: entries.length,
+          entries,
+        };
+      }
+      syncNoteView();
+    };
 
     setProgress(els.stepDeposit, 'running');
     log('扫描历史 Deposit，重建最新 Merkle Root...');
@@ -883,6 +930,8 @@ async function onSend() {
     }
 
     setProgress(els.stepDeposit, 'done');
+    syncCurrentFlowNote();
+    log('Deposit 已完成，Note 已生成，请立即复制或下载保存。', 'warn');
     setProgress(els.stepRequest, 'running');
 
     for (const item of pendingDeposits) {
@@ -892,7 +941,8 @@ async function onSend() {
 
       const requestId = req.requestId ?? '-';
       requestIds.push(requestId);
-      noteEntries.push({ ...item.note, requestId });
+      item.note.requestId = requestId;
+      syncCurrentFlowNote();
       log(`${item.prefix}请求已入队: ${requestId}`);
     }
 
@@ -900,20 +950,7 @@ async function onSend() {
     setProgress(els.stepDone, 'done');
     els.requestId.textContent =
       requestIds.length === 1 ? requestIds[0] : `${requestIds.length} requests`;
-
-    if (noteEntries.length === 1) {
-      latestNote = noteEntries[0];
-      els.note.value = JSON.stringify(noteEntries[0], null, 2);
-    } else {
-      latestNote = {
-        version: 1,
-        mode: 'batch',
-        createdAt: new Date().toISOString(),
-        count: noteEntries.length,
-        entries: noteEntries,
-      };
-      els.note.value = JSON.stringify(latestNote, null, 2);
-    }
+    syncCurrentFlowNote();
 
     log('流程完成。请等待 relayer 执行 transfer。');
   } catch (error) {
