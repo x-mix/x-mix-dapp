@@ -397,6 +397,58 @@ async function fetchPoolCommitments(connection, programId, poolPk, scanLimit) {
   return commitments;
 }
 
+async function fetchDepositInstructionIndexMap(connection, signature, programId, poolPk) {
+  const tx = await connection.getParsedTransaction(signature, {
+    commitment: 'confirmed',
+    maxSupportedTransactionVersion: 0,
+  });
+
+  if (!tx || tx.meta?.err) {
+    throw new Error(`无法读取已确认交易用于解析 Deposit 指令: ${signature}`);
+  }
+
+  const indexMap = new Map();
+
+  for (let i = 0; i < tx.transaction.message.instructions.length; i += 1) {
+    const ix = tx.transaction.message.instructions[i];
+    if (!('programId' in ix) || !ix.programId.equals(programId)) continue;
+    if (!('accounts' in ix) || ix.accounts.length < 2) continue;
+    if (ix.accounts[1].toBase58() !== poolPk.toBase58()) continue;
+
+    const commitment = parseDepositCommitment(ix);
+    if (!commitment) continue;
+    indexMap.set(bytesToHex(commitment), i);
+  }
+
+  return indexMap;
+}
+
+async function applyOnchainDepositInstructionIndexes({
+  connection,
+  signature,
+  programId,
+  poolPk,
+  items,
+}) {
+  const indexMap = await fetchDepositInstructionIndexMap(
+    connection,
+    signature,
+    programId,
+    poolPk
+  );
+
+  for (const item of items) {
+    const actualIx = indexMap.get(item.note.commitmentHex);
+    if (actualIx === undefined) {
+      throw new Error(
+        `未在链上交易中定位到 Deposit 指令: ${signature} (commitment=${item.note.commitmentHex.slice(0, 16)}...)`
+      );
+    }
+    item.note.depositSignature = signature;
+    item.note.depositInstructionIndex = actualIx;
+  }
+}
+
 function derivePoolAndVault(programId, mintPk, assetTypeByte) {
   const [pool] = PublicKey.findProgramAddressSync(
     [
@@ -760,8 +812,17 @@ async function onSend() {
         for (let batchIdx = 0; batchIdx < depositBatches.length; batchIdx += 1) {
           const signature = batchSignatures[batchIdx];
           const batch = depositBatches[batchIdx];
+          // Resolve actual on-chain instruction indexes because wallet may inject
+          // extra instructions (e.g. compute budget), shifting planned indexes.
+          // eslint-disable-next-line no-await-in-loop
+          await applyOnchainDepositInstructionIndexes({
+            connection,
+            signature,
+            programId,
+            poolPk: pool,
+            items: batch.items,
+          });
           for (const item of batch.items) {
-            item.note.depositSignature = signature;
             els.txLink.href = `https://solscan.io/tx/${signature}`;
             els.txLink.textContent = signature;
             log(
@@ -786,11 +847,18 @@ async function onSend() {
         for (let i = 0; i < pendingDeposits.length; i += 1) {
           const signature = depositSignatures[i];
           const item = pendingDeposits[i];
-          item.note.depositSignature = signature;
+          // eslint-disable-next-line no-await-in-loop
+          await applyOnchainDepositInstructionIndexes({
+            connection,
+            signature,
+            programId,
+            poolPk: pool,
+            items: [item],
+          });
 
           els.txLink.href = `https://solscan.io/tx/${signature}`;
           els.txLink.textContent = signature;
-          log(`${item.prefix}Deposit 成功: ${signature} (ix=1)`);
+          log(`${item.prefix}Deposit 成功: ${signature} (ix=${item.note.depositInstructionIndex})`);
         }
       }
     } else {
@@ -802,11 +870,16 @@ async function onSend() {
       });
 
       const item = pendingDeposits[0];
-      item.note.depositSignature = signature;
-      item.note.depositInstructionIndex = 1;
+      await applyOnchainDepositInstructionIndexes({
+        connection,
+        signature,
+        programId,
+        poolPk: pool,
+        items: [item],
+      });
       els.txLink.href = `https://solscan.io/tx/${signature}`;
       els.txLink.textContent = signature;
-      log(`${item.prefix}Deposit 成功: ${signature} (ix=1)`);
+      log(`${item.prefix}Deposit 成功: ${signature} (ix=${item.note.depositInstructionIndex})`);
     }
 
     setProgress(els.stepDeposit, 'done');
