@@ -36,6 +36,8 @@ const RELAYER_STATE_STALE_SLOT_GAP = 40;
 const POOL_COMMITMENTS_CACHE_PREFIX = 'xmix_pool_commitments_cache_v2:';
 const CHUNK_RELOAD_GUARD_KEY = 'xmix_chunk_reload_guard_v1';
 const CHUNK_RELOAD_GUARD_MS = 5 * 60 * 1000;
+const CHAIN_SCAN_PAGE_SIZE = 1000;
+const CHAIN_SCAN_MAX_SIGNATURES = 10_000;
 
 const TOKEN_PROGRAM_ID = new PublicKey(
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
@@ -523,11 +525,28 @@ async function fetchPoolCommitments(connection, programId, poolPk, scanLimit) {
     return fromRelayer;
   }
 
-  const signatures = await connection.getSignaturesForAddress(
-    programId,
-    { limit: scanLimit },
-    'confirmed'
-  );
+  const signatures = [];
+  let before;
+  while (true) {
+    const page = await connection.getSignaturesForAddress(
+      programId,
+      { limit: CHAIN_SCAN_PAGE_SIZE, before },
+      'confirmed'
+    );
+    if (page.length === 0) {
+      break;
+    }
+    signatures.push(...page);
+    if (page.length < CHAIN_SCAN_PAGE_SIZE) {
+      break;
+    }
+    before = page[page.length - 1].signature;
+    if (signatures.length >= CHAIN_SCAN_MAX_SIGNATURES) {
+      throw new Error(
+        `链上回退扫描达到上限 ${CHAIN_SCAN_MAX_SIGNATURES} 笔签名，无法安全计算 newRoot；请等待 relayer 同步后重试。`
+      );
+    }
+  }
 
   signatures.sort((a, b) => a.slot - b.slot);
 
@@ -575,39 +594,61 @@ async function fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit) {
   const pool = poolPk.toBase58();
   const cached = readPoolCommitmentsCache(pool);
   try {
-    const url = `${DEFAULT_RELAYER_API}/api/pool/${pool}/commitments?limit=${scanLimit}`;
-    const response = await fetch(url, { method: 'GET' });
-    if (!response.ok) {
-      return null;
-    }
+    const fetchCommitments = async (limit) => {
+      const url = `${DEFAULT_RELAYER_API}/api/pool/${pool}/commitments?limit=${limit}`;
+      const response = await fetch(url, { method: 'GET' });
+      if (!response.ok) return null;
+      const payload = await response.json();
+      if (!payload?.ok || !payload?.result) return null;
+      return payload.result;
+    };
 
-    const payload = await response.json();
-    if (!payload?.ok || !payload?.result) {
-      return null;
-    }
+    const baseResult = await fetchCommitments(scanLimit);
+    if (!baseResult) return null;
 
-    const lastSeenSlot = Number(payload.result.lastSeenSlot ?? NaN);
+    const lastSeenSlot = Number(baseResult.lastSeenSlot ?? NaN);
     if (Number.isFinite(lastSeenSlot)) {
       const currentSlot = await connection.getSlot('confirmed');
       if (currentSlot - lastSeenSlot > RELAYER_STATE_STALE_SLOT_GAP) {
         log(
-          `Relayer 索引落后 ${currentSlot - lastSeenSlot} slots，回退链上扫描以保证 newRoot 准确性。`,
+          `Relayer 索引落后 ${currentSlot - lastSeenSlot} slots，回退链上全量分页扫描以保证 newRoot 准确性。`,
           'warn'
         );
         return null;
       }
     }
 
-    const commitmentsHex = Array.isArray(payload.result.commitmentsHex)
-      ? payload.result.commitmentsHex
-      : [];
-    if (payload.result.rootMatches === false) {
+    if (baseResult.rootMatches === false) {
       log('Relayer Merkle 快照未对齐链上，回退链上扫描以保证 newRoot 准确性。', 'warn');
       return null;
     }
 
-    const versionStamp = `${String(payload.result.stateUpdatedAt || '')}:${String(
-      payload.result.commitmentCount ?? commitmentsHex.length
+    const commitmentCount = Number(baseResult.commitmentCount ?? 0);
+    const baseCommitmentsHex = Array.isArray(baseResult.commitmentsHex)
+      ? baseResult.commitmentsHex
+      : [];
+    let commitmentsHex = baseCommitmentsHex;
+
+    if (
+      Number.isInteger(commitmentCount) &&
+      commitmentCount > 0 &&
+      commitmentCount > baseCommitmentsHex.length
+    ) {
+      const fullResult = await fetchCommitments(commitmentCount);
+      if (fullResult?.rootMatches === false) {
+        log('Relayer Merkle 快照未对齐链上，回退链上扫描以保证 newRoot 准确性。', 'warn');
+        return null;
+      }
+      const fullCommitmentsHex = Array.isArray(fullResult?.commitmentsHex)
+        ? fullResult.commitmentsHex
+        : [];
+      if (fullCommitmentsHex.length === commitmentCount) {
+        commitmentsHex = fullCommitmentsHex;
+      }
+    }
+
+    const versionStamp = `${String(baseResult.stateUpdatedAt || '')}:${String(
+      commitmentCount || commitmentsHex.length
     )}`;
     if (
       cached &&
