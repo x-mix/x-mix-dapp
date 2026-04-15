@@ -33,6 +33,8 @@ const MAX_RECIPIENTS_PER_DEPOSIT_TX = 7;
 const NOTE_DRAFT_STORAGE_KEY = 'xmix_note_draft_v1';
 const POOL_SCAN_TX_CONCURRENCY = 12;
 const RELAYER_STATE_STALE_SLOT_GAP = 40;
+const CHUNK_RELOAD_GUARD_KEY = 'xmix_chunk_reload_guard_v1';
+const CHUNK_RELOAD_GUARD_MS = 5 * 60 * 1000;
 
 const TOKEN_PROGRAM_ID = new PublicKey(
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
@@ -76,6 +78,7 @@ boot();
 
 function boot() {
   provider = resolveWalletProvider();
+  installChunkLoadRecovery();
 
   els.connectBtn.addEventListener('click', onConnectWallet);
   els.sendBtn.addEventListener('click', onSend);
@@ -92,6 +95,58 @@ function boot() {
   syncSendButtonState();
   restoreLatestNoteFromStorage();
   log('准备就绪。');
+}
+
+function shouldAutoReloadAfterChunkError() {
+  try {
+    const last = Number(sessionStorage.getItem(CHUNK_RELOAD_GUARD_KEY) || '0');
+    const now = Date.now();
+    if (now - last < CHUNK_RELOAD_GUARD_MS) {
+      return false;
+    }
+    sessionStorage.setItem(CHUNK_RELOAD_GUARD_KEY, String(now));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isDynamicImportChunkError(message) {
+  if (typeof message !== 'string') return false;
+  return message.includes('Failed to fetch dynamically imported module');
+}
+
+function installChunkLoadRecovery() {
+  const handle = (reason) => {
+    const message =
+      reason instanceof Error
+        ? reason.message
+        : typeof reason === 'string'
+          ? reason
+          : String(reason);
+
+    if (!isDynamicImportChunkError(message)) {
+      return false;
+    }
+
+    if (shouldAutoReloadAfterChunkError()) {
+      log('检测到前端资源版本已更新，正在自动刷新页面...', 'warn');
+      setTimeout(() => window.location.reload(), 150);
+    } else {
+      log('前端资源加载失败，请手动强制刷新页面（Ctrl+F5）。', 'error');
+    }
+    return true;
+  };
+
+  window.addEventListener('error', (event) => {
+    handle(event?.error ?? event?.message);
+  });
+
+  window.addEventListener('unhandledrejection', (event) => {
+    if (handle(event.reason)) {
+      event.preventDefault();
+    }
+  });
 }
 
 function getWalletProvider() {
@@ -759,17 +814,32 @@ async function buildWithdrawRequest(note, recipient) {
   let lastError = 'unknown error';
 
   for (let attempt = 1; attempt <= REQUEST_RETRY_ATTEMPTS; attempt += 1) {
-    const res = await fetch(`${DEFAULT_RELAYER_API}/api/relay-request/build`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        note,
-        recipient,
-        relayerFeeLamports: RELAYER_FEE_LAMPORTS,
-      }),
-    });
+    let res;
+    try {
+      res = await fetch(`${DEFAULT_RELAYER_API}/api/relay-request/build`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          note,
+          recipient,
+          relayerFeeLamports: RELAYER_FEE_LAMPORTS,
+        }),
+      });
+    } catch (error) {
+      lastError =
+        error instanceof Error
+          ? `Relayer API fetch failed: ${error.message}`
+          : `Relayer API fetch failed: ${String(error)}`;
+      if (attempt >= REQUEST_RETRY_ATTEMPTS) {
+        throw new Error(lastError);
+      }
+      log(`Relayer API 网络异常，${REQUEST_RETRY_WAIT_MS / 1000}s 后重试 (${attempt}/${REQUEST_RETRY_ATTEMPTS})...`, 'warn');
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(REQUEST_RETRY_WAIT_MS);
+      continue;
+    }
 
     let payload = null;
     try {
