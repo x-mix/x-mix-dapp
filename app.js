@@ -33,7 +33,7 @@ const MAX_RECIPIENTS_PER_DEPOSIT_TX = 7;
 const NOTE_DRAFT_STORAGE_KEY = 'xmix_note_draft_v1';
 const POOL_SCAN_TX_CONCURRENCY = 12;
 const RELAYER_STATE_STALE_SLOT_GAP = 40;
-const POOL_COMMITMENTS_CACHE_PREFIX = 'xmix_pool_commitments_cache_v1:';
+const POOL_COMMITMENTS_CACHE_PREFIX = 'xmix_pool_commitments_cache_v2:';
 const CHUNK_RELOAD_GUARD_KEY = 'xmix_chunk_reload_guard_v1';
 const CHUNK_RELOAD_GUARD_MS = 5 * 60 * 1000;
 
@@ -601,6 +601,10 @@ async function fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit) {
     const commitmentsHex = Array.isArray(payload.result.commitmentsHex)
       ? payload.result.commitmentsHex
       : [];
+    if (payload.result.rootMatches === false) {
+      log('Relayer Merkle 快照未对齐链上，回退链上扫描以保证 newRoot 准确性。', 'warn');
+      return null;
+    }
 
     const versionStamp = `${String(payload.result.stateUpdatedAt || '')}:${String(
       payload.result.commitmentCount ?? commitmentsHex.length
