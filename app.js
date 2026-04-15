@@ -25,12 +25,14 @@ const SCAN_LIMIT = 220;
 const RELAYER_FEE_LAMPORTS = '0';
 // User-paid execution subsidy (A -> relayer) to cover relayer tx fee and nullifier rent.
 const RELAYER_EXECUTION_FEE_LAMPORTS = 1_230_960n;
-const REQUEST_RETRY_ATTEMPTS = 8;
-const REQUEST_RETRY_WAIT_MS = 4000;
+const REQUEST_RETRY_ATTEMPTS = 12;
+const REQUEST_RETRY_WAIT_MS = 2000;
 const MIN_SOL_DEPOSIT_LAMPORTS = 50_000_000n;
 const MIN_SOL_DEPOSIT_TEXT = '0.05';
 const MAX_RECIPIENTS_PER_DEPOSIT_TX = 7;
 const NOTE_DRAFT_STORAGE_KEY = 'xmix_note_draft_v1';
+const POOL_SCAN_TX_CONCURRENCY = 12;
+const RELAYER_STATE_STALE_SLOT_GAP = 40;
 
 const TOKEN_PROGRAM_ID = new PublicKey(
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
@@ -66,6 +68,7 @@ const els = {
 
 let provider = null;
 let poseidonPromise = null;
+let zeroTreePromise = null;
 let latestNote = null;
 let busy = false;
 
@@ -314,6 +317,13 @@ function bytesToHex(bytes) {
     .join('');
 }
 
+function hexToBytes(hex) {
+  if (typeof hex !== 'string' || hex.length !== 64 || !/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new Error('invalid 32-byte hex');
+  }
+  return new Uint8Array(Buffer.from(hex, 'hex'));
+}
+
 function random32Bytes() {
   const out = new Uint8Array(32);
   crypto.getRandomValues(out);
@@ -363,12 +373,17 @@ async function generateCommitment(secret, nullifier, amountLamports, poolPk) {
 }
 
 async function buildZeroTree() {
-  const zeros = [new Uint8Array(32)];
-  for (let i = 1; i <= TREE_LEVELS; i += 1) {
-    // eslint-disable-next-line no-await-in-loop
-    zeros[i] = await poseidonPair(zeros[i - 1], zeros[i - 1]);
+  if (!zeroTreePromise) {
+    zeroTreePromise = (async () => {
+      const zeros = [new Uint8Array(32)];
+      for (let i = 1; i <= TREE_LEVELS; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        zeros[i] = await poseidonPair(zeros[i - 1], zeros[i - 1]);
+      }
+      return zeros;
+    })();
   }
-  return zeros;
+  return zeroTreePromise;
 }
 
 async function computeMerkleRoot(commitments) {
@@ -413,6 +428,12 @@ function parseDepositCommitment(ix) {
 }
 
 async function fetchPoolCommitments(connection, programId, poolPk, scanLimit) {
+  const fromRelayer = await fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit);
+  if (fromRelayer) {
+    log(`已从 relayer 读取 ${fromRelayer.length} 条历史 commitment（跳过链上全量扫描）`);
+    return fromRelayer;
+  }
+
   const signatures = await connection.getSignaturesForAddress(
     programId,
     { limit: scanLimit },
@@ -422,14 +443,23 @@ async function fetchPoolCommitments(connection, programId, poolPk, scanLimit) {
   signatures.sort((a, b) => a.slot - b.slot);
 
   const commitments = [];
+  const poolAddress = poolPk.toBase58();
+  const txs = await mapWithConcurrency(
+    signatures,
+    POOL_SCAN_TX_CONCURRENCY,
+    async (sig) => {
+      try {
+        return await connection.getParsedTransaction(sig.signature, {
+          commitment: 'confirmed',
+          maxSupportedTransactionVersion: 0,
+        });
+      } catch {
+        return null;
+      }
+    }
+  );
 
-  for (const sig of signatures) {
-    // eslint-disable-next-line no-await-in-loop
-    const tx = await connection.getParsedTransaction(sig.signature, {
-      commitment: 'confirmed',
-      maxSupportedTransactionVersion: 0,
-    });
-
+  for (const tx of txs) {
     if (!tx || tx.meta?.err) continue;
 
     const logs = tx.meta?.logMessages ?? [];
@@ -440,7 +470,7 @@ async function fetchPoolCommitments(connection, programId, poolPk, scanLimit) {
     for (const ix of tx.transaction.message.instructions) {
       if (!('programId' in ix) || !ix.programId.equals(programId)) continue;
       if (!('accounts' in ix) || ix.accounts.length < 2) continue;
-      if (ix.accounts[1].toBase58() !== poolPk.toBase58()) continue;
+      if (ix.accounts[1].toBase58() !== poolAddress) continue;
 
       const commitment = parseDepositCommitment(ix);
       if (commitment) {
@@ -450,6 +480,60 @@ async function fetchPoolCommitments(connection, programId, poolPk, scanLimit) {
   }
 
   return commitments;
+}
+
+async function fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit) {
+  try {
+    const pool = poolPk.toBase58();
+    const url = `${DEFAULT_RELAYER_API}/api/pool/${pool}/commitments?limit=${scanLimit}`;
+    const response = await fetch(url, { method: 'GET' });
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = await response.json();
+    if (!payload?.ok || !payload?.result) {
+      return null;
+    }
+
+    const lastSeenSlot = Number(payload.result.lastSeenSlot ?? NaN);
+    if (Number.isFinite(lastSeenSlot)) {
+      const currentSlot = await connection.getSlot('confirmed');
+      if (currentSlot - lastSeenSlot > RELAYER_STATE_STALE_SLOT_GAP) {
+        log(
+          `Relayer 索引落后 ${currentSlot - lastSeenSlot} slots，回退链上扫描以保证 newRoot 准确性。`,
+          'warn'
+        );
+        return null;
+      }
+    }
+
+    const commitmentsHex = Array.isArray(payload.result.commitmentsHex)
+      ? payload.result.commitmentsHex
+      : [];
+
+    return commitmentsHex.map((hex) => hexToBytes(hex));
+  } catch {
+    return null;
+  }
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  const limit = Math.max(1, Math.min(concurrency, items.length || 1));
+  const results = new Array(items.length);
+  let cursor = 0;
+
+  const runners = Array.from({ length: limit }, async () => {
+    while (cursor < items.length) {
+      const current = cursor;
+      cursor += 1;
+      // eslint-disable-next-line no-await-in-loop
+      results[current] = await worker(items[current], current);
+    }
+  });
+
+  await Promise.all(runners);
+  return results;
 }
 
 async function fetchDepositInstructionIndexMap(connection, signature, programId, poolPk) {
@@ -960,14 +1044,39 @@ async function onSend() {
 
     for (const item of pendingDeposits) {
       log(`${item.prefix}提交 Withdraw 请求到 relayer...`);
-      // eslint-disable-next-line no-await-in-loop
-      const req = await buildWithdrawRequest(item.note, item.target.recipient);
+    }
 
-      const requestId = req.requestId ?? '-';
-      requestIds.push(requestId);
-      item.note.requestId = requestId;
-      syncCurrentFlowNote();
-      log(`${item.prefix}请求已入队: ${requestId}`);
+    const requestResults = await Promise.allSettled(
+      pendingDeposits.map((item) =>
+        buildWithdrawRequest(item.note, item.target.recipient)
+      )
+    );
+
+    let firstRequestError = null;
+    for (let i = 0; i < requestResults.length; i += 1) {
+      const item = pendingDeposits[i];
+      const result = requestResults[i];
+      if (result.status === 'fulfilled') {
+        const requestId = result.value?.requestId ?? '-';
+        requestIds.push(requestId);
+        item.note.requestId = requestId;
+        log(`${item.prefix}请求已入队: ${requestId}`);
+        continue;
+      }
+
+      const message =
+        result.reason instanceof Error
+          ? result.reason.message
+          : String(result.reason);
+      if (!firstRequestError) {
+        firstRequestError = message;
+      }
+      log(`${item.prefix}提交 Withdraw 请求失败: ${message}`, 'error');
+    }
+
+    syncCurrentFlowNote();
+    if (firstRequestError) {
+      throw new Error(firstRequestError);
     }
 
     setProgress(els.stepRequest, 'done');
