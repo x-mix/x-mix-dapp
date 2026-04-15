@@ -33,6 +33,7 @@ const MAX_RECIPIENTS_PER_DEPOSIT_TX = 7;
 const NOTE_DRAFT_STORAGE_KEY = 'xmix_note_draft_v1';
 const POOL_SCAN_TX_CONCURRENCY = 12;
 const RELAYER_STATE_STALE_SLOT_GAP = 40;
+const POOL_COMMITMENTS_CACHE_PREFIX = 'xmix_pool_commitments_cache_v1:';
 const CHUNK_RELOAD_GUARD_KEY = 'xmix_chunk_reload_guard_v1';
 const CHUNK_RELOAD_GUARD_MS = 5 * 60 * 1000;
 
@@ -379,6 +380,39 @@ function hexToBytes(hex) {
   return new Uint8Array(Buffer.from(hex, 'hex'));
 }
 
+function getPoolCommitmentsCacheKey(poolAddress) {
+  return `${POOL_COMMITMENTS_CACHE_PREFIX}${poolAddress}`;
+}
+
+function readPoolCommitmentsCache(poolAddress) {
+  try {
+    const raw = localStorage.getItem(getPoolCommitmentsCacheKey(poolAddress));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (!Array.isArray(parsed.commitmentsHex)) return null;
+    if (typeof parsed.versionStamp !== 'string') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writePoolCommitmentsCache(poolAddress, versionStamp, commitmentsHex) {
+  try {
+    localStorage.setItem(
+      getPoolCommitmentsCacheKey(poolAddress),
+      JSON.stringify({
+        versionStamp,
+        commitmentsHex,
+        updatedAt: new Date().toISOString(),
+      })
+    );
+  } catch {
+    // ignore
+  }
+}
+
 function random32Bytes() {
   const out = new Uint8Array(32);
   crypto.getRandomValues(out);
@@ -538,8 +572,9 @@ async function fetchPoolCommitments(connection, programId, poolPk, scanLimit) {
 }
 
 async function fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit) {
+  const pool = poolPk.toBase58();
+  const cached = readPoolCommitmentsCache(pool);
   try {
-    const pool = poolPk.toBase58();
     const url = `${DEFAULT_RELAYER_API}/api/pool/${pool}/commitments?limit=${scanLimit}`;
     const response = await fetch(url, { method: 'GET' });
     if (!response.ok) {
@@ -567,6 +602,18 @@ async function fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit) {
       ? payload.result.commitmentsHex
       : [];
 
+    const versionStamp = `${String(payload.result.stateUpdatedAt || '')}:${String(
+      payload.result.commitmentCount ?? commitmentsHex.length
+    )}`;
+    if (
+      cached &&
+      cached.versionStamp === versionStamp &&
+      Array.isArray(cached.commitmentsHex)
+    ) {
+      return cached.commitmentsHex.map((hex) => hexToBytes(hex));
+    }
+
+    writePoolCommitmentsCache(pool, versionStamp, commitmentsHex);
     return commitmentsHex.map((hex) => hexToBytes(hex));
   } catch {
     return null;
