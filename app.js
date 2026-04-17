@@ -30,6 +30,7 @@ const REQUEST_RETRY_WAIT_MS = 2000;
 const MIN_SOL_DEPOSIT_LAMPORTS = 50_000_000n;
 const MIN_SOL_DEPOSIT_TEXT = '0.05';
 const MAX_RECIPIENTS_PER_DEPOSIT_TX = 7;
+const MAX_RECIPIENTS_PER_INPUT = 5;
 const NOTE_DRAFT_STORAGE_KEY = 'xmix_note_draft_v1';
 const POOL_SCAN_TX_CONCURRENCY = 12;
 const RELAYER_STATE_STALE_SLOT_GAP = 300;
@@ -319,6 +320,9 @@ function parseRecipientTargets(rawRecipients, defaultAmountText) {
 
   if (lines.length === 0) {
     throw new Error('请填写收币地址。');
+  }
+  if (lines.length > MAX_RECIPIENTS_PER_INPUT) {
+    throw new Error(`单次最多支持 ${MAX_RECIPIENTS_PER_INPUT} 个收币地址，请分批操作。`);
   }
 
   const out = [];
