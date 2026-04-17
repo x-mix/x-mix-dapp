@@ -31,6 +31,7 @@ const MIN_SOL_DEPOSIT_LAMPORTS = 50_000_000n;
 const MIN_SOL_DEPOSIT_TEXT = '0.05';
 const MAX_RECIPIENTS_PER_DEPOSIT_TX = 7;
 const MAX_RECIPIENTS_PER_INPUT = 5;
+const RECIPIENT_LIMIT_WARN_THROTTLE_MS = 2000;
 const NOTE_DRAFT_STORAGE_KEY = 'xmix_note_draft_v1';
 const POOL_SCAN_TX_CONCURRENCY = 12;
 const RELAYER_STATE_STALE_SLOT_GAP = 300;
@@ -77,6 +78,7 @@ let poseidonPromise = null;
 let zeroTreePromise = null;
 let latestNote = null;
 let busy = false;
+let recipientLimitWarnAt = 0;
 
 boot();
 
@@ -86,7 +88,7 @@ function boot() {
 
   els.connectBtn.addEventListener('click', onConnectWallet);
   els.sendBtn.addEventListener('click', onSend);
-  els.recipient.addEventListener('input', syncSendButtonState);
+  els.recipient.addEventListener('input', onRecipientInput);
   els.amountSol.addEventListener('input', syncSendButtonState);
   els.copyNoteBtn.addEventListener('click', onCopyNote);
   els.downloadNoteBtn.addEventListener('click', onDownloadNote);
@@ -99,6 +101,48 @@ function boot() {
   syncSendButtonState();
   restoreLatestNoteFromStorage();
   log('准备就绪。');
+}
+
+function trimRecipientInputToLimit(raw) {
+  const lines = String(raw ?? '').replace(/\r/g, '').split('\n');
+  const kept = [];
+  let nonEmptyCount = 0;
+  let truncated = false;
+
+  for (const line of lines) {
+    const nonEmpty = line.trim().length > 0;
+    if (nonEmpty) {
+      if (nonEmptyCount >= MAX_RECIPIENTS_PER_INPUT) {
+        truncated = true;
+        continue;
+      }
+      nonEmptyCount += 1;
+    }
+    kept.push(line);
+  }
+
+  return { value: kept.join('\n'), truncated };
+}
+
+function onRecipientInput() {
+  const { value, truncated } = trimRecipientInputToLimit(els.recipient.value);
+  if (truncated) {
+    const cursor = els.recipient.selectionStart ?? value.length;
+    els.recipient.value = value;
+    const nextCursor = Math.min(cursor, value.length);
+    try {
+      els.recipient.setSelectionRange(nextCursor, nextCursor);
+    } catch {
+      // ignore cursor restore failure
+    }
+
+    const now = Date.now();
+    if (now - recipientLimitWarnAt >= RECIPIENT_LIMIT_WARN_THROTTLE_MS) {
+      recipientLimitWarnAt = now;
+      log(`最多仅可输入 ${MAX_RECIPIENTS_PER_INPUT} 个收币地址，超出部分已自动忽略。`, 'warn');
+    }
+  }
+  syncSendButtonState();
 }
 
 function shouldAutoReloadAfterChunkError() {
