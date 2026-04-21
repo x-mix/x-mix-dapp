@@ -45,6 +45,7 @@ const CHUNK_RELOAD_GUARD_KEY = 'xmix_chunk_reload_guard_v1';
 const CHUNK_RELOAD_GUARD_MS = 5 * 60 * 1000;
 const CHAIN_SCAN_PAGE_SIZE = 1000;
 const CHAIN_SCAN_MAX_SIGNATURES = 10_000;
+const SPL_TOKEN_ACCOUNT_LEN = 165;
 const ASSET_CONFIGS = {
   sol: {
     key: 'sol',
@@ -56,7 +57,7 @@ const ASSET_CONFIGS = {
     minBaseUnits: MIN_SOL_DEPOSIT_LAMPORTS,
     minAmountText: MIN_SOL_DEPOSIT_TEXT,
     defaultAmountText: '0.1',
-    relayerExecutionFeeBaseUnits: RELAYER_EXECUTION_FEE_LAMPORTS,
+    relayerExecutionSubsidyLamports: RELAYER_EXECUTION_FEE_LAMPORTS,
   },
   usdc: {
     key: 'usdc',
@@ -68,7 +69,7 @@ const ASSET_CONFIGS = {
     minBaseUnits: MIN_USDC_DEPOSIT_BASE_UNITS,
     minAmountText: MIN_USDC_DEPOSIT_TEXT,
     defaultAmountText: '10',
-    relayerExecutionFeeBaseUnits: 0n,
+    relayerExecutionSubsidyLamports: RELAYER_EXECUTION_FEE_LAMPORTS,
   },
 };
 
@@ -408,6 +409,10 @@ function formatBaseUnitsToUi(baseUnits, decimals) {
   const whole = baseUnits / scale;
   const frac = (baseUnits % scale).toString().padStart(decimals, '0').replace(/0+$/, '');
   return frac ? `${whole.toString()}.${frac}` : whole.toString();
+}
+
+function formatLamportsToSol(lamports) {
+  return formatBaseUnitsToUi(lamports, 9);
 }
 
 function syncSendButtonState() {
@@ -965,6 +970,7 @@ function findAssociatedTokenAddress(owner, mint) {
 function createDepositTx({
   walletPubkey,
   amountBaseUnits,
+  relayerExecutionSubsidyLamports,
   commitment,
   newRoot,
   asset,
@@ -1003,14 +1009,14 @@ function createDepositTx({
     data: ixData,
   });
 
-  if (!asset.relayerExecutionFeeBaseUnits) {
+  if (!relayerExecutionSubsidyLamports) {
     return new Transaction().add(ix);
   }
 
   const relayerExecutionFeeIx = SystemProgram.transfer({
     fromPubkey: walletPubkey,
     toPubkey: relayerExecutor,
-    lamports: Number(asset.relayerExecutionFeeBaseUnits),
+    lamports: Number(relayerExecutionSubsidyLamports),
   });
 
   return new Transaction().add(relayerExecutionFeeIx, ix);
@@ -1293,6 +1299,14 @@ async function onSend() {
         `当前 ${asset.symbol} 资产账户: wallet ATA=${depositorTokenAccount.toBase58()}, vault ATA=${vaultTokenAccount.toBase58()}`
       );
     }
+    const recipientAtaRentLamports = usingTokenAccounts
+      ? BigInt(
+          await connection.getMinimumBalanceForRentExemption(
+            SPL_TOKEN_ACCOUNT_LEN,
+            'confirmed'
+          )
+        )
+      : 0n;
 
     for (let i = 0; i < targets.length; i += 1) {
       const target = targets[i];
@@ -1311,17 +1325,30 @@ async function onSend() {
       const newRoot = await computeMerkleRoot([...commitmentsForBatch, commitment]);
       commitmentsForBatch.push(commitment);
 
-      const totalUserOutflowBaseUnits =
-        target.amountBaseUnits + asset.relayerExecutionFeeBaseUnits;
+      const recipientPk = new PublicKey(target.recipient);
+      const recipientTokenAccount = usingTokenAccounts
+        ? findAssociatedTokenAddress(recipientPk, mintPk)
+        : null;
+      const recipientAtaMissing = usingTokenAccounts
+        ? !(await connection.getAccountInfo(recipientTokenAccount, 'confirmed'))
+        : false;
+      const recipientAtaSubsidyLamports = recipientAtaMissing ? recipientAtaRentLamports : 0n;
+      const relayerExecutionSubsidyLamports =
+        asset.relayerExecutionSubsidyLamports + recipientAtaSubsidyLamports;
+
       const amountUi = formatBaseUnitsToUi(target.amountBaseUnits, asset.decimals);
-      const executionFeeUi = formatBaseUnitsToUi(
-        asset.relayerExecutionFeeBaseUnits,
-        asset.decimals
-      );
-      const totalOutflowUi = formatBaseUnitsToUi(totalUserOutflowBaseUnits, asset.decimals);
-      if (asset.relayerExecutionFeeBaseUnits > 0n) {
+      const executionFeeSol = formatLamportsToSol(relayerExecutionSubsidyLamports);
+      const totalUserOutflowLamports =
+        asset.key === 'sol'
+          ? target.amountBaseUnits + relayerExecutionSubsidyLamports
+          : relayerExecutionSubsidyLamports;
+      if (relayerExecutionSubsidyLamports > 0n) {
+        const ataHint =
+          recipientAtaSubsidyLamports > 0n
+            ? `（含收款ATA建账资助 ${formatLamportsToSol(recipientAtaSubsidyLamports)} SOL）`
+            : '';
         log(
-          `${prefix}构建链上 Deposit 交易（存款 ${amountUi} ${asset.symbol} + 中继执行费 ${executionFeeUi} ${asset.symbol}）...`
+          `${prefix}构建链上 Deposit 交易（存款 ${amountUi} ${asset.symbol} + 中继资助费 ${executionFeeSol} SOL${ataHint}）...`
         );
       } else {
         log(`${prefix}构建链上 Deposit 交易（存款 ${amountUi} ${asset.symbol}）...`);
@@ -1330,6 +1357,7 @@ async function onSend() {
       const tx = createDepositTx({
         walletPubkey: provider.publicKey,
         amountBaseUnits: target.amountBaseUnits,
+        relayerExecutionSubsidyLamports,
         commitment,
         newRoot,
         asset,
@@ -1339,10 +1367,6 @@ async function onSend() {
         depositorTokenAccount,
         vaultTokenAccount,
       });
-
-      const recipientTokenAccount = usingTokenAccounts
-        ? findAssociatedTokenAddress(new PublicKey(target.recipient), mintPk)
-        : null;
       const note = {
         version: 1,
         createdAt: new Date().toISOString(),
@@ -1357,10 +1381,16 @@ async function onSend() {
         recipient: target.recipient,
         amountLamports: target.amountBaseUnits.toString(),
         amountUi,
-        relayerExecutionFeeLamports: asset.relayerExecutionFeeBaseUnits.toString(),
-        relayerExecutionFeeUi: executionFeeUi,
-        totalUserOutflowLamports: totalUserOutflowBaseUnits.toString(),
-        totalUserOutflowUi: totalOutflowUi,
+        relayerExecutionFeeLamports: relayerExecutionSubsidyLamports.toString(),
+        relayerExecutionFeeUi: executionFeeSol,
+        relayerExecutionFeeSol: executionFeeSol,
+        recipientAtaSubsidyLamports: recipientAtaSubsidyLamports.toString(),
+        recipientAtaSubsidySol: formatLamportsToSol(recipientAtaSubsidyLamports),
+        totalUserOutflowLamports: totalUserOutflowLamports.toString(),
+        totalUserOutflowUi:
+          asset.key === 'sol'
+            ? formatLamportsToSol(totalUserOutflowLamports)
+            : `${amountUi} ${asset.symbol} + ${executionFeeSol} SOL`,
         vaultTokenAccount: vaultTokenAccount?.toBase58(),
         recipientTokenAccount: recipientTokenAccount?.toBase58(),
         relayerExecutor: DEFAULT_RELAYER_EXECUTOR,
@@ -1373,8 +1403,7 @@ async function onSend() {
       };
       if (asset.key === 'sol') {
         note.amountSol = amountUi;
-        note.relayerExecutionFeeSol = executionFeeUi;
-        note.totalUserOutflowSol = totalOutflowUi;
+        note.totalUserOutflowSol = formatLamportsToSol(totalUserOutflowLamports);
       }
 
       pendingDeposits.push({
