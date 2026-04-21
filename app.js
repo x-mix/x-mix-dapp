@@ -220,7 +220,10 @@ function shouldAutoReloadAfterChunkError() {
 
 function isDynamicImportChunkError(message) {
   if (typeof message !== 'string') return false;
-  return message.includes('Failed to fetch dynamically imported module');
+  return (
+    message.includes('Failed to fetch dynamically imported module') ||
+    message.includes('Importing a module script failed')
+  );
 }
 
 function installChunkLoadRecovery() {
@@ -251,6 +254,13 @@ function installChunkLoadRecovery() {
 
   window.addEventListener('unhandledrejection', (event) => {
     if (handle(event.reason)) {
+      event.preventDefault();
+    }
+  });
+
+  // Vite-specific chunk preload failure hook.
+  window.addEventListener('vite:preloadError', (event) => {
+    if (handle(event?.payload ?? event?.error ?? event?.message)) {
       event.preventDefault();
     }
   });
