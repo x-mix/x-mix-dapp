@@ -830,6 +830,71 @@ async function fetchDepositInstructionIndexMap(connection, signature, programId,
   return indexMap;
 }
 
+async function ensureSplDepositPrerequisites({
+  connection,
+  programId,
+  mintPk,
+  poolPk,
+  vaultPk,
+  depositorTokenAccount,
+  vaultTokenAccount,
+  totalAmountBaseUnits,
+  asset,
+}) {
+  const [poolInfo, vaultInfo, depositorTokenInfo] = await Promise.all([
+    connection.getAccountInfo(poolPk, 'confirmed'),
+    connection.getAccountInfo(vaultTokenAccount, 'confirmed'),
+    connection.getAccountInfo(depositorTokenAccount, 'confirmed'),
+  ]);
+
+  if (!poolInfo || !poolInfo.owner.equals(programId)) {
+    throw new Error(
+      `${asset.symbol} 池未初始化（pool=${poolPk.toBase58()}）。请先由管理员初始化 ${asset.symbol} 池后再存入。`
+    );
+  }
+
+  if (!vaultInfo) {
+    throw new Error(
+      `${asset.symbol} 池 vault ATA 不存在（vault ATA=${vaultTokenAccount.toBase58()}）。请先初始化池子。`
+    );
+  }
+
+  if (!depositorTokenInfo) {
+    throw new Error(
+      `当前钱包没有 ${asset.symbol} ATA（wallet ATA=${depositorTokenAccount.toBase58()}）。请先在钱包创建 ATA 并转入 ${asset.symbol}。`
+    );
+  }
+
+  let balance;
+  try {
+    const tokenBal = await connection.getTokenAccountBalance(
+      depositorTokenAccount,
+      'confirmed'
+    );
+    balance = BigInt(tokenBal?.value?.amount ?? '0');
+  } catch {
+    balance = 0n;
+  }
+
+  if (balance < totalAmountBaseUnits) {
+    const need = formatBaseUnitsToUi(totalAmountBaseUnits, asset.decimals);
+    const have = formatBaseUnitsToUi(balance, asset.decimals);
+    throw new Error(
+      `${asset.symbol} 余额不足：当前 ${have} ${asset.symbol}，需要 ${need} ${asset.symbol}。`
+    );
+  }
+
+  // sanity check for wrong mint wiring
+  if (asset.mint !== mintPk.toBase58()) {
+    throw new Error(
+      `资产 mint 不一致：asset=${asset.mint} tx=${mintPk.toBase58()}`
+    );
+  }
+  if (!vaultPk) {
+    throw new Error('vault 账户缺失');
+  }
+}
+
 async function applyOnchainDepositInstructionIndexes({
   connection,
   signature,
@@ -1206,6 +1271,23 @@ async function onSend() {
       SCAN_LIMIT
     );
     const commitmentsForBatch = [...historicalCommitments];
+    if (usingTokenAccounts) {
+      const totalAmountBaseUnits = targets.reduce(
+        (sum, item) => sum + item.amountBaseUnits,
+        0n
+      );
+      await ensureSplDepositPrerequisites({
+        connection,
+        programId,
+        mintPk,
+        poolPk: pool,
+        vaultPk: vault,
+        depositorTokenAccount,
+        vaultTokenAccount,
+        totalAmountBaseUnits,
+        asset,
+      });
+    }
     if (usingTokenAccounts) {
       log(
         `当前 ${asset.symbol} 资产账户: wallet ATA=${depositorTokenAccount.toBase58()}, vault ATA=${vaultTokenAccount.toBase58()}`
