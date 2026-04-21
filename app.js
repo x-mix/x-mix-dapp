@@ -29,6 +29,7 @@ const RELAYER_FEE_LAMPORTS = '0';
 const RELAYER_EXECUTION_FEE_LAMPORTS = 1_230_960n;
 const REQUEST_RETRY_ATTEMPTS = 12;
 const REQUEST_RETRY_WAIT_MS = 2000;
+const REQUEST_RETRY_MAX_WAIT_MS = 20_000;
 const MIN_SOL_DEPOSIT_LAMPORTS = 50_000_000n;
 const MIN_SOL_DEPOSIT_TEXT = '0.05';
 const MIN_USDC_DEPOSIT_BASE_UNITS = 10_000_000n;
@@ -734,8 +735,9 @@ async function fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit) {
     }
 
     if (baseResult.rootMatches === false) {
-      log('Relayer Merkle 快照未对齐链上，回退链上扫描以保证 newRoot 准确性。', 'warn');
-      return null;
+      throw new Error(
+        'Relayer Merkle 快照与链上不一致（rootMatches=false），已中止本次流程以避免产生无法提现的请求。请先修复 relayer 索引后再重试。'
+      );
     }
 
     const commitmentCount = Number(baseResult.commitmentCount ?? 0);
@@ -751,8 +753,9 @@ async function fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit) {
     ) {
       const fullResult = await fetchCommitments(commitmentCount);
       if (fullResult?.rootMatches === false) {
-        log('Relayer Merkle 快照未对齐链上，回退链上扫描以保证 newRoot 准确性。', 'warn');
-        return null;
+        throw new Error(
+          'Relayer Merkle 快照与链上不一致（rootMatches=false），已中止本次流程以避免产生无法提现的请求。请先修复 relayer 索引后再重试。'
+        );
       }
       const fullCommitmentsHex = Array.isArray(fullResult?.commitmentsHex)
         ? fullResult.commitmentsHex
@@ -775,7 +778,10 @@ async function fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit) {
 
     writePoolCommitmentsCache(pool, versionStamp, commitmentsHex);
     return commitmentsHex.map((hex) => hexToBytes(hex));
-  } catch {
+  } catch (error) {
+    if (error instanceof Error) {
+      throw error;
+    }
     return null;
   }
 }
@@ -1037,6 +1043,14 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function computeRetryDelayMs(attempt) {
+  const exp = Math.max(0, attempt - 1);
+  const base = REQUEST_RETRY_WAIT_MS * 2 ** exp;
+  const capped = Math.min(REQUEST_RETRY_MAX_WAIT_MS, base);
+  const jitter = Math.floor(Math.random() * 400);
+  return capped + jitter;
+}
+
 async function buildWithdrawRequest(note, recipient) {
   let lastError = 'unknown error';
 
@@ -1069,9 +1083,13 @@ async function buildWithdrawRequest(note, recipient) {
       if (attempt >= REQUEST_RETRY_ATTEMPTS) {
         throw new Error(lastError);
       }
-      log(`Relayer API 网络异常，${REQUEST_RETRY_WAIT_MS / 1000}s 后重试 (${attempt}/${REQUEST_RETRY_ATTEMPTS})...`, 'warn');
+      const delayMs = computeRetryDelayMs(attempt);
+      log(
+        `Relayer API 网络异常，${Math.round(delayMs / 1000)}s 后重试 (${attempt}/${REQUEST_RETRY_ATTEMPTS})...`,
+        'warn'
+      );
       // eslint-disable-next-line no-await-in-loop
-      await sleep(REQUEST_RETRY_WAIT_MS);
+      await sleep(delayMs);
       continue;
     }
 
@@ -1088,6 +1106,7 @@ async function buildWithdrawRequest(note, recipient) {
 
     lastError = payload?.error || `HTTP ${res.status}`;
     const retryable =
+      res.status === 429 ||
       lastError.includes('Deposit not found in relayer state') ||
       lastError.includes('missing decoded deposit payload');
 
@@ -1095,9 +1114,20 @@ async function buildWithdrawRequest(note, recipient) {
       throw new Error(lastError);
     }
 
-    log(`Relayer 尚未索引到该 Deposit，${REQUEST_RETRY_WAIT_MS / 1000}s 后重试 (${attempt}/${REQUEST_RETRY_ATTEMPTS})...`, 'warn');
+    const delayMs = computeRetryDelayMs(attempt);
+    if (res.status === 429) {
+      log(
+        `Relayer API 限流 (HTTP 429)，${Math.round(delayMs / 1000)}s 后重试 (${attempt}/${REQUEST_RETRY_ATTEMPTS})...`,
+        'warn'
+      );
+    } else {
+      log(
+        `Relayer 尚未索引到该 Deposit，${Math.round(delayMs / 1000)}s 后重试 (${attempt}/${REQUEST_RETRY_ATTEMPTS})...`,
+        'warn'
+      );
+    }
     // eslint-disable-next-line no-await-in-loop
-    await sleep(REQUEST_RETRY_WAIT_MS);
+    await sleep(delayMs);
   }
 
   throw new Error(lastError);
@@ -1386,32 +1416,23 @@ async function onSend() {
       log(`${item.prefix}提交 Withdraw 请求到 relayer...`);
     }
 
-    const requestResults = await Promise.allSettled(
-      pendingDeposits.map((item) =>
-        buildWithdrawRequest(item.note, item.target.recipient)
-      )
-    );
-
     let firstRequestError = null;
-    for (let i = 0; i < requestResults.length; i += 1) {
+    for (let i = 0; i < pendingDeposits.length; i += 1) {
       const item = pendingDeposits[i];
-      const result = requestResults[i];
-      if (result.status === 'fulfilled') {
-        const requestId = result.value?.requestId ?? '-';
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const result = await buildWithdrawRequest(item.note, item.target.recipient);
+        const requestId = result?.requestId ?? '-';
         requestIds.push(requestId);
         item.note.requestId = requestId;
         log(`${item.prefix}请求已入队: ${requestId}`);
-        continue;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!firstRequestError) {
+          firstRequestError = message;
+        }
+        log(`${item.prefix}提交 Withdraw 请求失败: ${message}`, 'error');
       }
-
-      const message =
-        result.reason instanceof Error
-          ? result.reason.message
-          : String(result.reason);
-      if (!firstRequestError) {
-        firstRequestError = message;
-      }
-      log(`${item.prefix}提交 Withdraw 请求失败: ${message}`, 'error');
     }
 
     syncCurrentFlowNote();
