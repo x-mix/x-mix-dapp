@@ -4,6 +4,7 @@ Standalone frontend for x-mix.
 
 ## UX
 - Connect wallet
+- Select asset (`SOL` / `USDC`)
 - Fill recipient address
 - Input amount
 - Click `确认发送`
@@ -12,6 +13,10 @@ The page automatically:
 - sends on-chain `deposit`
 - generates a backup note
 - submits relayer request to `POST /api/relay-request/build`
+
+Current defaults:
+- `SOL`: wrapped SOL mint (`So111...`), minimum 0.05 SOL.
+- `USDC`: mainnet USDC mint (`EPjF...`), minimum 10 USDC.
 
 ## Stack
 - Vite build

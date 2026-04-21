@@ -117,6 +117,7 @@ label span,
 }
 
 input,
+select,
 textarea {
   width: 100%;
   font-family: 'IBM Plex Mono', monospace;
@@ -129,6 +130,7 @@ textarea {
 }
 
 input:focus,
+select:focus,
 textarea:focus {
   outline: none;
   border-color: #3a9cc8;

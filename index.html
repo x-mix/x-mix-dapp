@@ -44,7 +44,14 @@
           ></textarea>
         </label>
         <label>
-          <span>默认转账金额 (SOL)</span>
+          <span>资产</span>
+          <select id="assetSelect">
+            <option value="sol">SOL</option>
+            <option value="usdc">USDC</option>
+          </select>
+        </label>
+        <label>
+          <span id="amountLabel">默认转账金额 (SOL)</span>
           <input id="amountSol" type="text" value="0.1" autocomplete="off" />
         </label>
 
