@@ -7,20 +7,43 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&family=Teko:wght@500;600&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
+    <div class="frame-noise"></div>
     <div class="glow glow-a"></div>
     <div class="glow glow-b"></div>
 
     <main class="shell">
       <header class="hero card">
-        <p class="tag">X-MIX MAINNET</p>
-        <h1>一键混币</h1>
-        <p class="sub">连接钱包 -> 填收币地址 -> 输入金额 -> 确认发送</p>
+        <figure class="brand-mark">
+          <img src="/brand/xmix.png" alt="X-Mix Logo" />
+        </figure>
+
+        <div class="hero-copy">
+          <p class="tag">X-MIX MAINNET</p>
+          <h1>隐私转账控制台</h1>
+          <p class="sub">连接钱包 -> 填收币地址 -> 输入金额 -> 确认发送</p>
+          <p class="flow-tip">支持 SOL / USDC，批量地址单次最多 5 个。</p>
+        </div>
+
+        <div class="hero-stats">
+          <div class="stat">
+            <span>模式</span>
+            <strong>Mainnet</strong>
+          </div>
+          <div class="stat">
+            <span>资产</span>
+            <strong>SOL + USDC</strong>
+          </div>
+          <div class="stat">
+            <span>流程</span>
+            <strong>Deposit / Relay</strong>
+          </div>
+        </div>
       </header>
 
       <section class="card">
@@ -33,60 +56,66 @@
         </div>
       </section>
 
-      <section class="card action-card">
-        <h2>发送参数</h2>
-        <label>
-          <span>收币地址（支持批量）</span>
-          <textarea
-            id="recipient"
-            rows="4"
-            placeholder="一行一个地址，或 地址,金额&#10;例如：&#10;9RCu7f...WTQr&#10;7GwEXx...Qfwft,0.2"
-          ></textarea>
-        </label>
-        <label>
-          <span>资产</span>
-          <select id="assetSelect">
-            <option value="sol">SOL</option>
-            <option value="usdc">USDC</option>
-          </select>
-        </label>
-        <label>
-          <span id="amountLabel">默认转账金额 (SOL)</span>
-          <input id="amountSol" type="text" value="0.1" autocomplete="off" />
-        </label>
+      <section class="panel-grid">
+        <section class="card action-card">
+          <h2>发送参数</h2>
+          <label>
+            <span>收币地址（支持批量）</span>
+            <textarea
+              id="recipient"
+              rows="4"
+              placeholder="一行一个地址，或 地址,金额&#10;例如：&#10;9RCu7f...WTQr&#10;7GwEXx...Qfwft,0.2"
+            ></textarea>
+          </label>
+          <label>
+            <span>资产</span>
+            <select id="assetSelect">
+              <option value="sol">SOL</option>
+              <option value="usdc">USDC</option>
+            </select>
+          </label>
+          <label>
+            <span id="amountLabel">默认转账金额 (SOL)</span>
+            <input id="amountSol" type="text" value="0.1" autocomplete="off" />
+          </label>
 
-        <button id="sendBtn" class="btn primary">确认发送</button>
+          <button id="sendBtn" class="btn primary">确认发送</button>
 
-        <ul class="steps" id="steps">
-          <li id="stepDeposit">1. 发起链上 Deposit</li>
-          <li id="stepRequest">2. 提交 Withdraw 请求</li>
-          <li id="stepDone">3. 等待 Relayer 处理</li>
-        </ul>
+          <ul class="steps" id="steps">
+            <li id="stepDeposit">1. 发起链上 Deposit</li>
+            <li id="stepRequest">2. 提交 Withdraw 请求</li>
+            <li id="stepDone">3. 等待 Relayer 处理</li>
+          </ul>
+        </section>
+
+        <aside class="side-stack">
+          <section class="card result-card">
+            <h2>结果</h2>
+            <div class="result-grid">
+              <div>
+                <p class="label">Deposit 交易</p>
+                <a id="txLink" class="mono link" href="#" target="_blank" rel="noreferrer"
+                  >等待交易</a
+                >
+              </div>
+              <div>
+                <p class="label">Request ID</p>
+                <p id="requestId" class="mono">-</p>
+              </div>
+            </div>
+          </section>
+
+          <details class="card backup-card">
+            <summary>备份恢复码（高级）</summary>
+            <p class="muted">请离线保存。异常时可用该 note 追踪与重建提现请求。</p>
+            <textarea id="note" rows="10" placeholder="发送后自动生成"></textarea>
+            <div class="row">
+              <button id="copyNoteBtn" class="btn ghost" type="button">复制 Note</button>
+              <button id="downloadNoteBtn" class="btn ghost" type="button">下载 Note</button>
+            </div>
+          </details>
+        </aside>
       </section>
-
-      <section class="card result-card">
-        <h2>结果</h2>
-        <div class="result-grid">
-          <div>
-            <p class="label">Deposit 交易</p>
-            <a id="txLink" class="mono link" href="#" target="_blank" rel="noreferrer">等待交易</a>
-          </div>
-          <div>
-            <p class="label">Request ID</p>
-            <p id="requestId" class="mono">-</p>
-          </div>
-        </div>
-      </section>
-
-      <details class="card backup-card">
-        <summary>备份恢复码（高级）</summary>
-        <p class="muted">请离线保存。异常时可用该 note 追踪与重建提现请求。</p>
-        <textarea id="note" rows="10" placeholder="发送后自动生成"></textarea>
-        <div class="row">
-          <button id="copyNoteBtn" class="btn ghost" type="button">复制 Note</button>
-          <button id="downloadNoteBtn" class="btn ghost" type="button">下载 Note</button>
-        </div>
-      </details>
 
       <section class="card log-card">
         <h2>状态日志</h2>
