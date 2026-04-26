@@ -14,7 +14,7 @@ if (!globalThis.Buffer) {
 }
 
 const DEFAULT_RPC =
-  'https://solana-mainnet.core.chainstack.com/f0158c9f5215c3582abcc22025df14f4';
+  'https://solana-mainnet.core.chainstack.com/f3567c66a8587aa41e8b0a15250393e0';
 const DEFAULT_PROGRAM_ID = 'XmixQ4DB8MtKcEFhyjWs1gZtdaF3YDuF4ieGLJ3xotv';
 const DEFAULT_RELAYER_API = 'https://api.xmix.dev';
 const DEFAULT_RELAYER_EXECUTOR = 'xxxXGCRExgFF2EEWKU1QDDDYBL6Ma2X299ynEgEVff5';
