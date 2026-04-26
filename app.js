@@ -27,9 +27,9 @@ const SCAN_LIMIT = 220;
 const RELAYER_FEE_LAMPORTS = '0';
 // User-paid execution subsidy (A -> relayer) to cover relayer tx fee and nullifier rent.
 const RELAYER_EXECUTION_FEE_LAMPORTS = 1_230_960n;
-const REQUEST_RETRY_ATTEMPTS = 12;
-const REQUEST_RETRY_WAIT_MS = 2000;
-const REQUEST_RETRY_MAX_WAIT_MS = 20_000;
+const REQUEST_RETRY_ATTEMPTS = 6;
+const REQUEST_RETRY_WAIT_MS = 1200;
+const REQUEST_RETRY_MAX_WAIT_MS = 8000;
 const MIN_SOL_DEPOSIT_LAMPORTS = 50_000_000n;
 const MIN_SOL_DEPOSIT_TEXT = '0.05';
 const MIN_USDC_DEPOSIT_BASE_UNITS = 10_000_000n;
@@ -40,6 +40,11 @@ const RECIPIENT_LIMIT_WARN_THROTTLE_MS = 2000;
 const NOTE_DRAFT_STORAGE_KEY = 'xmix_note_draft_v1';
 const POOL_SCAN_TX_CONCURRENCY = 12;
 const RELAYER_STATE_STALE_SLOT_GAP = 300;
+const ALLOW_CHAIN_FULL_SCAN_FALLBACK = false;
+const WITHDRAW_REQUEST_BUILD_CONCURRENCY = 3;
+const DEPOSIT_BROADCAST_CONCURRENCY = 3;
+const DEPOSIT_CONFIRM_CONCURRENCY = 3;
+const DEPOSIT_INDEX_RESOLVE_CONCURRENCY = 4;
 const POOL_COMMITMENTS_CACHE_PREFIX = 'xmix_pool_commitments_cache_v2:';
 const CHUNK_RELOAD_GUARD_KEY = 'xmix_chunk_reload_guard_v1';
 const CHUNK_RELOAD_GUARD_MS = 5 * 60 * 1000;
@@ -656,6 +661,14 @@ async function fetchPoolCommitments(connection, programId, poolPk, scanLimit) {
     return fromRelayer;
   }
 
+  if (!ALLOW_CHAIN_FULL_SCAN_FALLBACK) {
+    throw new Error(
+      'Relayer commitments 暂不可用或未同步完成。当前版本已禁用前端链上全量回退扫描以提升速度与稳定性，请稍后重试。'
+    );
+  }
+
+  log('Relayer commitments 不可用，执行链上回退扫描（可能较慢）...', 'warn');
+
   const signatures = [];
   let before;
   while (true) {
@@ -741,11 +754,17 @@ async function fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit) {
     if (Number.isFinite(lastSeenSlot)) {
       const currentSlot = await connection.getSlot('confirmed');
       if (currentSlot - lastSeenSlot > RELAYER_STATE_STALE_SLOT_GAP) {
-        log(
-          `Relayer 索引落后 ${currentSlot - lastSeenSlot} slots，回退链上全量分页扫描以保证 newRoot 准确性。`,
-          'warn'
+        const lagSlots = currentSlot - lastSeenSlot;
+        if (ALLOW_CHAIN_FULL_SCAN_FALLBACK) {
+          log(
+            `Relayer 索引落后 ${lagSlots} slots，回退链上全量分页扫描以保证 newRoot 准确性。`,
+            'warn'
+          );
+          return null;
+        }
+        throw new Error(
+          `Relayer 索引落后 ${lagSlots} slots。为避免慢速链扫与错误 newRoot，请等待 relayer 同步后重试。`
         );
-        return null;
       }
     }
 
@@ -799,6 +818,94 @@ async function fetchPoolCommitmentsFromRelayer(connection, poolPk, scanLimit) {
     }
     return null;
   }
+}
+
+async function fetchPreparedDepositRootsFromRelayer(poolPk, pendingCommitments) {
+  const pool = poolPk.toBase58();
+  let response;
+  try {
+    response = await fetch(`${DEFAULT_RELAYER_API}/api/deposit/prepare`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        pool,
+        commitmentsHex: pendingCommitments.map((commitment) => bytesToHex(commitment)),
+      }),
+    });
+  } catch (error) {
+    throw new Error(
+      error instanceof Error
+        ? `Relayer deposit prepare fetch failed: ${error.message}`
+        : `Relayer deposit prepare fetch failed: ${String(error)}`
+    );
+  }
+
+  if (response.status === 404 || response.status === 501) {
+    return null;
+  }
+
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    // ignore
+  }
+
+  if (!response.ok) {
+    throw new Error(payload?.error || `HTTP ${response.status}`);
+  }
+  if (!payload?.ok || !payload?.result || !Array.isArray(payload?.result?.rootsHex)) {
+    throw new Error('invalid relayer deposit prepare response');
+  }
+
+  const rootsHex = payload.result.rootsHex;
+  if (rootsHex.length !== pendingCommitments.length) {
+    throw new Error(
+      `invalid relayer deposit prepare roots length: expected=${pendingCommitments.length}, got=${rootsHex.length}`
+    );
+  }
+  return rootsHex.map((hex) => hexToBytes(hex));
+}
+
+async function resolveBatchDepositRoots({
+  connection,
+  programId,
+  poolPk,
+  scanLimit,
+  pendingCommitments,
+}) {
+  try {
+    const preparedRoots = await fetchPreparedDepositRootsFromRelayer(
+      poolPk,
+      pendingCommitments
+    );
+    if (preparedRoots) {
+      log(`已从 relayer 预计算 ${preparedRoots.length} 条 newRoot（跳过前端 Poseidon 批量重算）`);
+      return preparedRoots;
+    }
+    log('Relayer 未启用 deposit prepare 接口，回退为前端本地计算 newRoot。', 'warn');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`Relayer 预计算 newRoot 失败，回退本地计算: ${message}`, 'warn');
+  }
+
+  log('回退模式：读取历史 commitments 并在前端本地计算 newRoot...', 'warn');
+  const historicalCommitments = await fetchPoolCommitments(
+    connection,
+    programId,
+    poolPk,
+    scanLimit
+  );
+  const roots = [];
+  const workingCommitments = [...historicalCommitments];
+  for (const commitment of pendingCommitments) {
+    workingCommitments.push(commitment);
+    // eslint-disable-next-line no-await-in-loop
+    roots.push(await computeMerkleRoot(workingCommitments));
+  }
+  return roots;
 }
 
 async function mapWithConcurrency(items, concurrency, worker) {
@@ -934,6 +1041,32 @@ async function applyOnchainDepositInstructionIndexes({
     item.note.depositSignature = signature;
     item.note.depositInstructionIndex = actualIx;
   }
+}
+
+async function applyOnchainDepositInstructionIndexesBySignatures({
+  connection,
+  programId,
+  poolPk,
+  entries,
+}) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return;
+  }
+
+  const concurrency = Math.max(
+    1,
+    Math.min(DEPOSIT_INDEX_RESOLVE_CONCURRENCY, entries.length)
+  );
+  await mapWithConcurrency(entries, concurrency, async (entry) => {
+    await applyOnchainDepositInstructionIndexes({
+      connection,
+      signature: entry.signature,
+      programId,
+      poolPk,
+      items: entry.items,
+    });
+    return null;
+  });
 }
 
 function derivePoolAndVault(programId, mintPk, assetTypeByte) {
@@ -1086,19 +1219,27 @@ async function sendDepositTransactions({ connection, walletPubkey, txs }) {
       }
 
       const signedTxs = await provider.signAllTransactions(txs);
-      const signatures = [];
-
-      for (const signedTx of signedTxs) {
-        // eslint-disable-next-line no-await-in-loop
-        const signature = await connection.sendRawTransaction(signedTx.serialize());
-        if (!signature) {
-          throw new Error('未获取到交易签名');
+      const sendConcurrency = Math.max(
+        1,
+        Math.min(DEPOSIT_BROADCAST_CONCURRENCY, signedTxs.length)
+      );
+      const signatures = await mapWithConcurrency(
+        signedTxs,
+        sendConcurrency,
+        async (signedTx) => {
+          const signature = await connection.sendRawTransaction(signedTx.serialize());
+          if (!signature) {
+            throw new Error('未获取到交易签名');
+          }
+          return signature;
         }
-        signatures.push(signature);
-      }
+      );
 
-      for (const signature of signatures) {
-        // eslint-disable-next-line no-await-in-loop
+      const confirmConcurrency = Math.max(
+        1,
+        Math.min(DEPOSIT_CONFIRM_CONCURRENCY, signatures.length)
+      );
+      await mapWithConcurrency(signatures, confirmConcurrency, async (signature) => {
         await connection.confirmTransaction(
           {
             signature,
@@ -1107,7 +1248,8 @@ async function sendDepositTransactions({ connection, walletPubkey, txs }) {
           },
           'confirmed'
         );
-      }
+        return null;
+      });
 
       return signatures;
     } catch (error) {
@@ -1132,22 +1274,26 @@ function computeRetryDelayMs(attempt) {
   return capped + jitter;
 }
 
+function makeWithdrawBuildRequestBody(note, recipient) {
+  return {
+    note,
+    recipient,
+    relayerFeeLamports: RELAYER_FEE_LAMPORTS,
+    mint: note?.mint,
+    pool: note?.pool,
+    vault: note?.vault,
+    vaultTokenAccount: note?.vaultTokenAccount,
+    recipientTokenAccount: note?.recipientTokenAccount,
+    feeCollectorTokenAccount: note?.feeCollectorTokenAccount,
+  };
+}
+
 async function buildWithdrawRequest(note, recipient) {
   let lastError = 'unknown error';
 
   for (let attempt = 1; attempt <= REQUEST_RETRY_ATTEMPTS; attempt += 1) {
     let res;
-    const requestBody = {
-      note,
-      recipient,
-      relayerFeeLamports: RELAYER_FEE_LAMPORTS,
-      mint: note?.mint,
-      pool: note?.pool,
-      vault: note?.vault,
-      vaultTokenAccount: note?.vaultTokenAccount,
-      recipientTokenAccount: note?.recipientTokenAccount,
-      feeCollectorTokenAccount: note?.feeCollectorTokenAccount,
-    };
+    const requestBody = makeWithdrawBuildRequestBody(note, recipient);
     try {
       res = await fetch(`${DEFAULT_RELAYER_API}/api/relay-request/build`, {
         method: 'POST',
@@ -1212,6 +1358,50 @@ async function buildWithdrawRequest(note, recipient) {
   }
 
   throw new Error(lastError);
+}
+
+async function buildWithdrawRequestsBatch(entries) {
+  let res;
+  try {
+    res = await fetch(`${DEFAULT_RELAYER_API}/api/relay-request/build-batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        requests: entries.map((item) => makeWithdrawBuildRequestBody(item.note, item.recipient)),
+      }),
+    });
+  } catch (error) {
+    throw new Error(
+      error instanceof Error
+        ? `Relayer batch API fetch failed: ${error.message}`
+        : `Relayer batch API fetch failed: ${String(error)}`
+    );
+  }
+
+  if (res.status === 404 || res.status === 501) {
+    return null;
+  }
+
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch {
+    // ignore
+  }
+
+  if (!res.ok) {
+    throw new Error(payload?.error || `HTTP ${res.status}`);
+  }
+  if (!payload?.ok || !Array.isArray(payload?.results)) {
+    throw new Error('invalid relayer batch response');
+  }
+
+  return {
+    results: payload.results,
+    summary: payload.summary,
+  };
 }
 
 async function onSend() {
@@ -1279,14 +1469,7 @@ async function onSend() {
     };
 
     setProgress(els.stepDeposit, 'running');
-    log('扫描历史 Deposit，重建最新 Merkle Root...');
-    const historicalCommitments = await fetchPoolCommitments(
-      connection,
-      programId,
-      pool,
-      SCAN_LIMIT
-    );
-    const commitmentsForBatch = [...historicalCommitments];
+    const pendingCommitments = [];
     if (usingTokenAccounts) {
       const totalAmountBaseUnits = targets.reduce(
         (sum, item) => sum + item.amountBaseUnits,
@@ -1332,8 +1515,7 @@ async function onSend() {
         target.amountBaseUnits,
         pool
       );
-      const newRoot = await computeMerkleRoot([...commitmentsForBatch, commitment]);
-      commitmentsForBatch.push(commitment);
+      pendingCommitments.push(commitment);
 
       const recipientPk = new PublicKey(target.recipient);
       const recipientTokenAccount = usingTokenAccounts
@@ -1363,20 +1545,6 @@ async function onSend() {
       } else {
         log(`${prefix}构建链上 Deposit 交易（存款 ${amountUi} ${asset.symbol}）...`);
       }
-
-      const tx = createDepositTx({
-        walletPubkey: provider.publicKey,
-        amountBaseUnits: target.amountBaseUnits,
-        relayerExecutionSubsidyLamports,
-        commitment,
-        newRoot,
-        asset,
-        mintPk,
-        poolPk: pool,
-        vaultPk: vault,
-        depositorTokenAccount,
-        vaultTokenAccount,
-      });
       const note = {
         version: 1,
         createdAt: new Date().toISOString(),
@@ -1405,7 +1573,7 @@ async function onSend() {
         recipientTokenAccount: recipientTokenAccount?.toBase58(),
         relayerExecutor: DEFAULT_RELAYER_EXECUTOR,
         commitmentHex: bytesToHex(commitment),
-        newRootHex: bytesToHex(newRoot),
+        newRootHex: '',
         secretHex: bytesToHex(secret),
         nullifierHex: bytesToHex(nullifier),
         depositSignature: '',
@@ -1420,7 +1588,39 @@ async function onSend() {
         prefix,
         target,
         note,
-        tx,
+        tx: null,
+        commitment,
+        relayerExecutionSubsidyLamports,
+      });
+    }
+
+    log('请求 relayer 预计算本批次 newRoot...');
+    const resolvedRoots = await resolveBatchDepositRoots({
+      connection,
+      programId,
+      poolPk: pool,
+      scanLimit: SCAN_LIMIT,
+      pendingCommitments,
+    });
+    for (let i = 0; i < pendingDeposits.length; i += 1) {
+      const item = pendingDeposits[i];
+      const newRoot = resolvedRoots[i];
+      if (!newRoot) {
+        throw new Error(`missing newRoot for deposit index ${i}`);
+      }
+      item.note.newRootHex = bytesToHex(newRoot);
+      item.tx = createDepositTx({
+        walletPubkey: provider.publicKey,
+        amountBaseUnits: item.target.amountBaseUnits,
+        relayerExecutionSubsidyLamports: item.relayerExecutionSubsidyLamports,
+        commitment: item.commitment,
+        newRoot,
+        asset,
+        mintPk,
+        poolPk: pool,
+        vaultPk: vault,
+        depositorTokenAccount,
+        vaultTokenAccount,
       });
     }
 
@@ -1455,19 +1655,19 @@ async function onSend() {
           txs: depositBatches.map((batch) => batch.tx),
         });
 
+        await applyOnchainDepositInstructionIndexesBySignatures({
+          connection,
+          programId,
+          poolPk: pool,
+          entries: batchSignatures.map((signature, batchIdx) => ({
+            signature,
+            items: depositBatches[batchIdx].items,
+          })),
+        });
+
         for (let batchIdx = 0; batchIdx < depositBatches.length; batchIdx += 1) {
           const signature = batchSignatures[batchIdx];
           const batch = depositBatches[batchIdx];
-          // Resolve actual on-chain instruction indexes because wallet may inject
-          // extra instructions (e.g. compute budget), shifting planned indexes.
-          // eslint-disable-next-line no-await-in-loop
-          await applyOnchainDepositInstructionIndexes({
-            connection,
-            signature,
-            programId,
-            poolPk: pool,
-            items: batch.items,
-          });
           for (const item of batch.items) {
             els.txLink.href = `https://solscan.io/tx/${signature}`;
             els.txLink.textContent = signature;
@@ -1490,17 +1690,19 @@ async function onSend() {
           txs: pendingDeposits.map((item) => item.tx),
         });
 
+        await applyOnchainDepositInstructionIndexesBySignatures({
+          connection,
+          programId,
+          poolPk: pool,
+          entries: depositSignatures.map((signature, idx) => ({
+            signature,
+            items: [pendingDeposits[idx]],
+          })),
+        });
+
         for (let i = 0; i < pendingDeposits.length; i += 1) {
           const signature = depositSignatures[i];
           const item = pendingDeposits[i];
-          // eslint-disable-next-line no-await-in-loop
-          await applyOnchainDepositInstructionIndexes({
-            connection,
-            signature,
-            programId,
-            poolPk: pool,
-            items: [item],
-          });
 
           els.txLink.href = `https://solscan.io/tx/${signature}`;
           els.txLink.textContent = signature;
@@ -1537,23 +1739,73 @@ async function onSend() {
       log(`${item.prefix}提交 Withdraw 请求到 relayer...`);
     }
 
-    let firstRequestError = null;
-    for (let i = 0; i < pendingDeposits.length; i += 1) {
-      const item = pendingDeposits[i];
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        const result = await buildWithdrawRequest(item.note, item.target.recipient);
-        const requestId = result?.requestId ?? '-';
-        requestIds.push(requestId);
-        item.note.requestId = requestId;
-        log(`${item.prefix}请求已入队: ${requestId}`);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!firstRequestError) {
-          firstRequestError = message;
+    let requestResults = null;
+    try {
+      const batchResult = await buildWithdrawRequestsBatch(
+        pendingDeposits.map((item) => ({
+          note: item.note,
+          recipient: item.target.recipient,
+        }))
+      );
+      if (batchResult) {
+        requestResults = batchResult.results;
+        const summary = batchResult.summary;
+        if (summary && Number.isInteger(summary.success) && Number.isInteger(summary.total)) {
+          log(
+            `批量请求提交完成: ${summary.success}/${summary.total} 成功${
+              Number.isInteger(summary.failed) ? `, ${summary.failed} 失败` : ''
+            }`
+          );
+        } else {
+          log('批量请求提交完成。');
         }
-        log(`${item.prefix}提交 Withdraw 请求失败: ${message}`, 'error');
+      } else {
+        log('Relayer 未启用批量 build 接口，回退为单条请求模式。', 'warn');
       }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`批量 build 接口调用失败，回退为单条请求模式: ${message}`, 'warn');
+    }
+
+    if (!requestResults) {
+      const requestConcurrency = Math.max(
+        1,
+        Math.min(WITHDRAW_REQUEST_BUILD_CONCURRENCY, pendingDeposits.length)
+      );
+      requestResults = await mapWithConcurrency(
+        pendingDeposits,
+        requestConcurrency,
+        async (item) => {
+          try {
+            const result = await buildWithdrawRequest(item.note, item.target.recipient);
+            return { requestId: result?.requestId ?? '-' };
+          } catch (error) {
+            return {
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        }
+      );
+    }
+
+    let firstRequestError = null;
+    for (let i = 0; i < requestResults.length; i += 1) {
+      const item = pendingDeposits[i];
+      const result = requestResults[i];
+      const resultError =
+        result?.error || (result?.ok === false ? 'relayer batch item failed' : null);
+      if (resultError) {
+        if (!firstRequestError) {
+          firstRequestError = resultError;
+        }
+        log(`${item.prefix}提交 Withdraw 请求失败: ${resultError}`, 'error');
+        continue;
+      }
+
+      const requestId = result?.requestId ?? result?.result?.requestId ?? '-';
+      requestIds.push(requestId);
+      item.note.requestId = requestId;
+      log(`${item.prefix}请求已入队: ${requestId}`);
     }
 
     syncCurrentFlowNote();
